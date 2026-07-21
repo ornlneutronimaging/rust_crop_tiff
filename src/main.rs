@@ -35,7 +35,12 @@ OPTIONS:
                             corner and size, in pixels)
   --output-stack <PATH>     Also write the cropped 3-D stack to PATH when
                             saving/returning: NumPy .npy, float32, shape
-                            (n_images, height, width)
+                            (n_images, height, width). The applied crop
+                            region always travels with the stack: it goes to
+                            --output when given, otherwise to a
+                            <stem>_crop.json sidecar next to the stack, so
+                            the caller can re-apply the same crop to another
+                            data set.
   -c, --crop <X,Y,W,H>      Initial crop region (e.g. a previous crop) shown
                             on the image at startup, e.g. 100,200,512,512
   --crop-file <PATH>        Read the initial crop region from a JSON file
@@ -43,12 +48,12 @@ OPTIONS:
   --called-from-app         The app is driven by another application that is
                             blocked waiting for the crop: the save button
                             reads '↩ Return to main application', which
-                            writes the crop to --output (or prints it on
-                            stdout when no --output is given), writes the
-                            cropped stack to --output-stack when given, and
-                            closes the window so the caller resumes.
-                            (--called-from-python and --called-from-marimo
-                            are accepted as synonyms.)
+                            writes the crop to --output (and always also
+                            prints it on stdout for the caller to capture),
+                            writes the cropped stack to --output-stack when
+                            given, and closes the window so the caller
+                            resumes. (--called-from-python and
+                            --called-from-marimo are accepted as synonyms.)
   --instructions <TEXT>     Instructions shown in a modal window on top of
                             the application at startup. Reopen any time with
                             the 'ℹ Instructions' toolbar button.

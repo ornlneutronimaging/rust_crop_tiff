@@ -119,13 +119,14 @@ struct Handle {
     vy: i8,
 }
 
-/// Where the crop JSON goes when the save/return button is pressed.
-enum JsonDest {
-    File(PathBuf),
-    /// Printed on stdout for a calling application to capture (the
-    /// rust_tof_profile_viewer convention).
-    Stdout,
-    None,
+/// Where the crop JSON goes when the save/return button is pressed. The crop
+/// region is always returned alongside a cropped stack, so the calling
+/// application can re-apply the same crop to another data set.
+struct JsonDest {
+    file: Option<PathBuf>,
+    /// Also print the JSON on stdout for a calling application to capture
+    /// (the rust_tof_profile_viewer convention).
+    stdout: bool,
 }
 
 pub struct CropApp {
@@ -577,17 +578,14 @@ impl CropApp {
                     notes.push(format!("cropped stack → {}", stack_path.display()));
                 }
                 let json = crop.to_json(data.width, data.height, &data.path.display().to_string());
-                match &json_dest {
-                    JsonDest::File(path) => {
-                        std::fs::write(path, json)
-                            .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
-                        notes.push(format!("crop → {}", path.display()));
-                    }
-                    JsonDest::Stdout => {
-                        println!("{json}");
-                        notes.push("crop → stdout".to_owned());
-                    }
-                    JsonDest::None => {}
+                if let Some(path) = &json_dest.file {
+                    std::fs::write(path, &json)
+                        .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+                    notes.push(format!("crop → {}", path.display()));
+                }
+                if json_dest.stdout {
+                    println!("{json}");
+                    notes.push("crop → stdout".to_owned());
                 }
                 Ok(format!("Saved: {}", notes.join(", ")))
             })();
@@ -622,16 +620,26 @@ impl CropApp {
         }
     }
 
-    /// The save-and-quit / return-to-caller button: crop JSON to `--output`
-    /// (or stdout when driven by another application without one), cropped
-    /// stack to `--output-stack` when given, then close.
+    /// The crop-JSON destination of the save-and-quit / return-to-caller
+    /// button: `--output` when given, otherwise a `<stem>_crop.json` sidecar
+    /// next to the cropped stack — the crop region is always returned so the
+    /// caller can re-apply it to another data set. Driven by another
+    /// application, the JSON is additionally printed on stdout.
+    fn quit_json_dest(&self) -> JsonDest {
+        let file = self
+            .output_path
+            .clone()
+            .or_else(|| self.output_stack.as_deref().map(stack_sidecar_json));
+        JsonDest {
+            file,
+            stdout: self.called_from_app,
+        }
+    }
+
+    /// The save-and-quit / return-to-caller button: crop JSON (and cropped
+    /// stack when `--output-stack` was given), then close.
     fn save_and_quit(&mut self) {
-        let json_dest = match (&self.output_path, self.called_from_app) {
-            (Some(p), _) => JsonDest::File(p.clone()),
-            (None, true) => JsonDest::Stdout,
-            (None, false) => JsonDest::None,
-        };
-        self.start_save(json_dest, self.output_stack.clone(), true);
+        self.start_save(self.quit_json_dest(), self.output_stack.clone(), true);
     }
 
     fn save_crop_dialog(&mut self) {
@@ -643,7 +651,14 @@ impl CropApp {
         else {
             return;
         };
-        self.start_save(JsonDest::File(path), None, false);
+        self.start_save(
+            JsonDest {
+                file: Some(path),
+                stdout: false,
+            },
+            None,
+            false,
+        );
     }
 
     fn save_stack_dialog(&mut self) {
@@ -655,7 +670,16 @@ impl CropApp {
         else {
             return;
         };
-        self.start_save(JsonDest::None, Some(path), false);
+        // The applied crop region always travels with the stack, as a
+        // `<stem>_crop.json` sidecar.
+        self.start_save(
+            JsonDest {
+                file: Some(stack_sidecar_json(&path)),
+                stdout: false,
+            },
+            Some(path),
+            false,
+        );
     }
 
     // ----- instructions modal ----------------------------------------------
@@ -906,12 +930,15 @@ impl CropApp {
 
                 // Save-and-quit / return-to-caller button, when there is
                 // somewhere for the result to go.
-                if self.called_from_app || self.output_path.is_some() {
+                if self.called_from_app || self.output_path.is_some() || self.output_stack.is_some()
+                {
+                    let dest = self.quit_json_dest();
                     let mut sends = Vec::new();
-                    match &self.output_path {
-                        Some(p) => sends.push(format!("crop → {}", p.display())),
-                        None if self.called_from_app => sends.push("crop → stdout".to_owned()),
-                        None => {}
+                    if let Some(p) = &dest.file {
+                        sends.push(format!("crop → {}", p.display()));
+                    }
+                    if dest.stdout {
+                        sends.push("crop → stdout".to_owned());
                     }
                     if let Some(p) = &self.output_stack {
                         sends.push(format!("cropped 3-D stack (.npy) → {}", p.display()));
@@ -1462,6 +1489,16 @@ impl CropApp {
 }
 
 // ----- helpers ----------------------------------------------------------------
+
+/// The `<stem>_crop.json` sidecar written next to a cropped stack, recording
+/// the crop region that was applied.
+fn stack_sidecar_json(stack: &Path) -> PathBuf {
+    let stem = stack
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cropped_stack");
+    stack.with_file_name(format!("{stem}_crop.json"))
+}
 
 fn folder_label(p: &Path) -> String {
     p.file_name()

@@ -48,7 +48,10 @@ crop_tiff stack.npy --called-from-app \
 - **`--output-stack <PATH.npy>`** — also write the **cropped 3-D stack** when
   saving/returning: NumPy `.npy`, `float32`, shape
   `(n_images, height, width)`. Written on a background thread (the stack can
-  be GBs); the window closes when it is done.
+  be GBs); the window closes when it is done. The **applied crop region always
+  travels with the stack** — to `--output` when given, otherwise to a
+  `<stem>_crop.json` sidecar next to the `.npy` — so the calling application
+  can re-apply the same crop to another data set (e.g. via `--crop-file`).
 - **`-c, --crop <X,Y,W,H>`** — initial crop region (e.g. the crop used last
   time), shown on the image at startup and kept as a dashed orange reference
   outline while you adjust the live (green) crop. **`--crop-file <PATH>`**
@@ -56,15 +59,15 @@ crop_tiff stack.npy --called-from-app \
 - **`--called-from-app`** — the app is driven by another application that is
   blocked waiting for the crop: the save button reads **↩ Return to main
   application** instead (the rust_tof_profile_viewer convention). It writes
-  the crop JSON to `--output` — or prints it on **stdout** when no `--output`
-  is given, for a caller that captures the child's output — writes the
-  cropped stack to `--output-stack` when given, and closes the window so the
-  caller resumes. `--called-from-python` and `--called-from-marimo` are
-  accepted as synonyms.
+  the crop JSON to `--output` (and always also prints it on **stdout**, for a
+  caller that captures the child's output), writes the cropped stack to
+  `--output-stack` when given, and closes the window so the caller resumes.
+  `--called-from-python` and `--called-from-marimo` are accepted as synonyms.
 - **`--instructions <TEXT>`** — shows `TEXT` in a modal dialog at startup;
   reopen with the **ℹ Instructions** toolbar button.
 - Without `--output`, use **💾 Save crop as…** / **🗋 Save cropped stack as…**
-  to pick the destinations.
+  to pick the destinations; saving a cropped stack interactively also writes
+  its `<stem>_crop.json` sidecar.
 
 ## Output format
 
