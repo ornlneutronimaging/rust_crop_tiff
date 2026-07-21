@@ -1,17 +1,20 @@
-//! Loading one folder of TIFF images.
+//! Loading one input: a folder of TIFF images, or a `.npy` stack file (2-D =
+//! one frame, 3-D = one frame per plane along axis 0 — the form used when
+//! another application such as rust_ct_reconstruction hands its stack over).
 //!
 //! Every frame is normalised to an `Array2<f32>` with shape `(height, width)`,
 //! row-major. Besides the frames themselves, the loader computes the pixel-wise
 //! projections used to judge a crop against the whole stack: sum, mean, max,
 //! min and standard deviation, plus the total counts of each frame.
 
+use crate::crop::CropRect;
 use anyhow::{anyhow, bail, Context, Result};
-use ndarray::Array2;
+use ndarray::{s, Array2, Array3};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Everything the application needs about one folder.
+/// Everything the application needs about one input (folder or `.npy` stack).
 pub struct FolderData {
     pub path: PathBuf,
     /// One frame per TIFF page, in sorted file order.
@@ -100,6 +103,32 @@ impl Acc {
     }
 }
 
+/// Whether `path` is something [`load_input_with_progress`] can open: a
+/// folder (of TIFF images) or a `.npy` stack file.
+pub fn is_supported_input(path: &Path) -> bool {
+    path.is_dir()
+        || (path.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("npy")))
+}
+
+/// Load one input — a folder of TIFF images or a `.npy` stack file — and
+/// compute the projections. `on_progress(files_done, files_total)` is called
+/// from worker threads as files finish, so a caller can drive a progress bar.
+pub fn load_input_with_progress<F>(path: &Path, on_progress: F) -> Result<FolderData>
+where
+    F: Fn(usize, usize) + Sync,
+{
+    if path.is_dir() {
+        return load_folder_with_progress(path, on_progress);
+    }
+    let frames = load_npy(path)?;
+    on_progress(1, 1);
+    build_folder_data(path, frames)
+}
+
 /// Load every TIFF of `dir` (in parallel) and compute the projections.
 /// `on_progress(files_done, files_total)` is called from worker threads as
 /// files finish, so a caller can drive a progress bar.
@@ -137,7 +166,16 @@ where
             frames.push(frame);
         }
     }
-    let (height, width) = dims.ok_or_else(|| anyhow!("No frames were loaded"))?;
+    build_folder_data(dir, frames)
+}
+
+/// Compute the projections and per-frame totals of `frames` (all of the same
+/// size) and assemble the [`FolderData`].
+fn build_folder_data(path: &Path, frames: Vec<Array2<f32>>) -> Result<FolderData> {
+    let (height, width) = match frames.first() {
+        Some(f) => (f.shape()[0], f.shape()[1]),
+        None => return Err(anyhow!("No frames were loaded")),
+    };
     let len = width * height;
     let n = frames.len() as f64;
 
@@ -169,7 +207,7 @@ where
         .collect();
 
     Ok(FolderData {
-        path: dir.to_path_buf(),
+        path: path.to_path_buf(),
         frames,
         width,
         height,
@@ -180,6 +218,76 @@ where
         std: Array2::from_shape_vec(shape, std)?,
         frame_totals,
     })
+}
+
+/// Read a `.npy` file: a 2-D array becomes one frame, a 3-D array one frame
+/// per plane along axis 0. The dtype is probed among the common numeric types.
+fn load_npy(path: &Path) -> Result<Vec<Array2<f32>>> {
+    use ndarray_npy::ReadNpyExt;
+    use std::io::Cursor;
+
+    let bytes = std::fs::read(path).with_context(|| format!("open {}", path.display()))?;
+
+    macro_rules! try_2d {
+        ($t:ty) => {
+            if let Ok(a) = Array2::<$t>::read_npy(Cursor::new(&bytes[..])) {
+                return Ok(vec![a.mapv(|v| v as f32)]);
+            }
+        };
+    }
+    macro_rules! try_3d {
+        ($t:ty) => {
+            if let Ok(a) = Array3::<$t>::read_npy(Cursor::new(&bytes[..])) {
+                return Ok(a
+                    .outer_iter()
+                    .map(|plane| plane.mapv(|v| v as f32))
+                    .collect());
+            }
+        };
+    }
+
+    try_2d!(f32);
+    try_2d!(f64);
+    try_2d!(u8);
+    try_2d!(u16);
+    try_2d!(i16);
+    try_2d!(u32);
+    try_2d!(i32);
+    try_2d!(u64);
+    try_2d!(i64);
+    try_3d!(f32);
+    try_3d!(f64);
+    try_3d!(u8);
+    try_3d!(u16);
+    try_3d!(i16);
+    try_3d!(u32);
+    try_3d!(i32);
+    try_3d!(u64);
+    try_3d!(i64);
+
+    bail!(
+        "Unsupported .npy dtype or shape (need a 2-D or 3-D numeric array): {}",
+        path.display()
+    )
+}
+
+/// The cropped stack as one contiguous `float32` array of shape
+/// `(n_frames, crop.height, crop.width)` — what `--output-stack` returns to
+/// the calling application.
+pub fn cropped_stack(frames: &[Array2<f32>], crop: CropRect) -> Array3<f32> {
+    let mut out = Array3::<f32>::zeros((frames.len(), crop.height, crop.width));
+    for (i, f) in frames.iter().enumerate() {
+        out.slice_mut(s![i, .., ..])
+            .assign(&f.slice(s![crop.y..crop.y1(), crop.x..crop.x1()]));
+    }
+    out
+}
+
+/// Write the cropped stack to `path` as a NumPy `.npy` file.
+pub fn write_cropped_stack(path: &Path, frames: &[Array2<f32>], crop: CropRect) -> Result<()> {
+    let stack = cropped_stack(frames, crop);
+    ndarray_npy::write_npy(path, &stack)
+        .with_context(|| format!("write cropped stack {}", path.display()))
 }
 
 /// Read every page of a (possibly multi-page) TIFF file.
@@ -279,5 +387,48 @@ mod tests {
     fn folder_without_tiff_fails() {
         let dir = tmp_dir("empty");
         assert!(load_folder_with_progress(&dir, |_, _| {}).is_err());
+    }
+
+    #[test]
+    fn npy_3d_stack_loads_as_frames() {
+        let dir = tmp_dir("npy3d");
+        let path = dir.join("stack.npy");
+        // 2 frames of 3x4, values = 100*frame + 10*y + x.
+        let a = Array3::<u16>::from_shape_fn((2, 3, 4), |(k, y, x)| {
+            (100 * k + 10 * y + x) as u16
+        });
+        ndarray_npy::write_npy(&path, &a).unwrap();
+
+        assert!(is_supported_input(&path));
+        let data = load_input_with_progress(&path, |_, _| {}).unwrap();
+        assert_eq!(data.n_frames(), 2);
+        assert_eq!((data.width, data.height), (4, 3));
+        assert_eq!(data.frames[1][(2, 3)], 123.0);
+        assert_eq!(data.sum[(0, 1)], 1.0 + 101.0);
+    }
+
+    #[test]
+    fn cropped_stack_roundtrips_through_npy() {
+        use ndarray_npy::ReadNpyExt;
+
+        let dir = tmp_dir("cropped");
+        let path = dir.join("cropped.npy");
+        let frames: Vec<Array2<f32>> = (0..2)
+            .map(|k| Array2::from_shape_fn((5, 6), |(y, x)| (100 * k + 10 * y + x) as f32))
+            .collect();
+        let crop = CropRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 2,
+        };
+        write_cropped_stack(&path, &frames, crop).unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let back = Array3::<f32>::read_npy(file).unwrap();
+        assert_eq!(back.shape(), &[2, 2, 3]);
+        // frame 1, crop-local (0, 0) is full-image (y=2, x=1).
+        assert_eq!(back[(1, 0, 0)], 121.0);
+        assert_eq!(back[(0, 1, 2)], 33.0);
     }
 }

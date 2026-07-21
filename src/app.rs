@@ -119,9 +119,19 @@ struct Handle {
     vy: i8,
 }
 
+/// Where the crop JSON goes when the save/return button is pressed.
+enum JsonDest {
+    File(PathBuf),
+    /// Printed on stdout for a calling application to capture (the
+    /// rust_tof_profile_viewer convention).
+    Stdout,
+    None,
+}
+
 pub struct CropApp {
-    folders: Vec<PathBuf>,
-    selected_folder: Option<usize>,
+    /// Folders of TIFF images and/or `.npy` stack files.
+    inputs: Vec<PathBuf>,
+    selected_input: Option<usize>,
 
     data: Option<Arc<FolderData>>,
     loading: Option<LoadJob>,
@@ -172,7 +182,12 @@ pub struct CropApp {
 
     // Saving.
     output_path: Option<PathBuf>,
-    called_from_python: bool,
+    /// Where the cropped 3-D stack (`.npy`, float32) is written on save/return.
+    output_stack: Option<PathBuf>,
+    called_from_app: bool,
+    /// A save running on a background thread (the cropped stack can be GBs).
+    saving_rx: Option<Receiver<Result<String, String>>>,
+    close_after_save: bool,
     instructions: Option<String>,
     show_instructions: bool,
 
@@ -182,20 +197,21 @@ pub struct CropApp {
 impl CropApp {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        folders: Vec<PathBuf>,
+        inputs: Vec<PathBuf>,
         initial_crop: Option<CropRect>,
         output_path: Option<PathBuf>,
-        called_from_python: bool,
+        output_stack: Option<PathBuf>,
+        called_from_app: bool,
         instructions: Option<String>,
     ) -> Self {
-        let status = if folders.is_empty() {
-            "Add a folder of TIFF images to begin.".to_owned()
+        let status = if inputs.is_empty() {
+            "Add a folder of TIFF images or a .npy stack to begin.".to_owned()
         } else {
-            format!("{} folder(s) on the command line.", folders.len())
+            format!("{} input(s) on the command line.", inputs.len())
         };
         Self {
-            folders,
-            selected_folder: None,
+            inputs,
+            selected_input: None,
             data: None,
             loading: None,
             mode: DisplayMode::Integrated,
@@ -229,17 +245,20 @@ impl CropApp {
             stats_dirty: false,
             plot_refit: false,
             output_path,
-            called_from_python,
+            output_stack,
+            called_from_app,
+            saving_rx: None,
+            close_after_save: false,
             show_instructions: instructions.is_some(),
             instructions,
             status,
         }
     }
 
-    /// Start loading the first command-line folder, if any.
+    /// Start loading the first command-line input, if any.
     pub fn select_first(&mut self, ctx: &egui::Context) {
-        if !self.folders.is_empty() {
-            self.select_folder(0, ctx);
+        if !self.inputs.is_empty() {
+            self.select_input(0, ctx);
         }
     }
 
@@ -249,13 +268,13 @@ impl CropApp {
         self.crop?.to_crop(data.width, data.height)
     }
 
-    // ----- folder loading ----------------------------------------------------
+    // ----- input loading -----------------------------------------------------
 
-    fn select_folder(&mut self, idx: usize, ctx: &egui::Context) {
-        let Some(dir) = self.folders.get(idx).cloned() else {
+    fn select_input(&mut self, idx: usize, ctx: &egui::Context) {
+        let Some(dir) = self.inputs.get(idx).cloned() else {
             return;
         };
-        self.selected_folder = Some(idx);
+        self.selected_input = Some(idx);
         self.status = format!("Loading {}…", folder_label(&dir));
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
@@ -264,7 +283,7 @@ impl CropApp {
             // The parallel loader reports progress from worker threads, so the
             // sender goes behind a mutex.
             let progress_tx = Mutex::new(tx.clone());
-            let result = loader::load_folder_with_progress(&dir, |done, total| {
+            let result = loader::load_input_with_progress(&dir, |done, total| {
                 if let Ok(tx) = progress_tx.lock() {
                     let _ = tx.send(LoadMsg::Progress { done, total });
                 }
@@ -528,22 +547,91 @@ impl CropApp {
 
     // ----- saving -------------------------------------------------------------
 
-    fn write_crop(&mut self, path: &Path) -> bool {
+    /// Write the crop JSON (to a file or stdout) and, when asked, the cropped
+    /// 3-D stack, on a background thread — the stack can be GBs. When
+    /// `close_after` is set the window closes once the save succeeded (the
+    /// save-and-quit / return-to-caller workflows).
+    fn start_save(&mut self, json_dest: JsonDest, stack_dest: Option<PathBuf>, close_after: bool) {
+        if self.saving_rx.is_some() {
+            return;
+        }
         let (Some(data), Some(crop)) = (self.data.clone(), self.crop_px()) else {
             self.status = "Nothing to save — draw a crop region first.".to_owned();
-            return false;
+            return;
         };
-        let json = crop.to_json(data.width, data.height, &data.path.display().to_string());
-        match std::fs::write(path, json) {
-            Ok(()) => {
-                self.status = format!("Crop written to {}", path.display());
-                true
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.saving_rx = Some(rx);
+        self.close_after_save = close_after;
+        self.status = match &stack_dest {
+            Some(p) => format!("Writing the cropped stack to {}…", p.display()),
+            None => "Saving the crop…".to_owned(),
+        };
+
+        std::thread::spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let mut notes: Vec<String> = Vec::new();
+                if let Some(stack_path) = &stack_dest {
+                    loader::write_cropped_stack(stack_path, &data.frames, crop)
+                        .map_err(|e| format!("Failed to write {}: {e:#}", stack_path.display()))?;
+                    notes.push(format!("cropped stack → {}", stack_path.display()));
+                }
+                let json = crop.to_json(data.width, data.height, &data.path.display().to_string());
+                match &json_dest {
+                    JsonDest::File(path) => {
+                        std::fs::write(path, json)
+                            .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+                        notes.push(format!("crop → {}", path.display()));
+                    }
+                    JsonDest::Stdout => {
+                        println!("{json}");
+                        notes.push("crop → stdout".to_owned());
+                    }
+                    JsonDest::None => {}
+                }
+                Ok(format!("Saved: {}", notes.join(", ")))
+            })();
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_saving(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.saving_rx else { return };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.saving_rx = None;
+                match result {
+                    Ok(msg) => {
+                        self.status = msg;
+                        if self.close_after_save {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                    Err(e) => self.status = e,
+                }
+                self.close_after_save = false;
             }
-            Err(e) => {
-                self.status = format!("Failed to write {}: {e}", path.display());
-                false
+            Err(TryRecvError::Empty) => {
+                // Keep polling while the background save runs.
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.saving_rx = None;
+                self.close_after_save = false;
             }
         }
+    }
+
+    /// The save-and-quit / return-to-caller button: crop JSON to `--output`
+    /// (or stdout when driven by another application without one), cropped
+    /// stack to `--output-stack` when given, then close.
+    fn save_and_quit(&mut self) {
+        let json_dest = match (&self.output_path, self.called_from_app) {
+            (Some(p), _) => JsonDest::File(p.clone()),
+            (None, true) => JsonDest::Stdout,
+            (None, false) => JsonDest::None,
+        };
+        self.start_save(json_dest, self.output_stack.clone(), true);
     }
 
     fn save_crop_dialog(&mut self) {
@@ -555,7 +643,19 @@ impl CropApp {
         else {
             return;
         };
-        self.write_crop(&path);
+        self.start_save(JsonDest::File(path), None, false);
+    }
+
+    fn save_stack_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("NumPy", &["npy"])
+            .set_file_name("cropped_stack.npy")
+            .set_title("Save the cropped 3-D stack as .npy (float32)")
+            .save_file()
+        else {
+            return;
+        };
+        self.start_save(JsonDest::None, Some(path), false);
     }
 
     // ----- instructions modal ----------------------------------------------
@@ -619,8 +719,19 @@ impl CropApp {
             .set_title("Add a folder of TIFF images")
             .pick_folder()
         {
-            self.folders.push(dir);
-            self.select_folder(self.folders.len() - 1, ctx);
+            self.inputs.push(dir);
+            self.select_input(self.inputs.len() - 1, ctx);
+        }
+    }
+
+    fn add_npy_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(file) = rfd::FileDialog::new()
+            .add_filter("NumPy", &["npy"])
+            .set_title("Add a .npy stack (2-D or 3-D array)")
+            .pick_file()
+        {
+            self.inputs.push(file);
+            self.select_input(self.inputs.len() - 1, ctx);
         }
     }
 
@@ -630,23 +741,30 @@ impl CropApp {
             if ui.button("📁 Add folder…").clicked() {
                 self.add_folder_dialog(&ctx);
             }
+            if ui
+                .button("🗋 Add .npy…")
+                .on_hover_text("Add a 2-D or 3-D .npy stack file (e.g. exported by another application)")
+                .clicked()
+            {
+                self.add_npy_dialog(&ctx);
+            }
 
             ui.separator();
 
-            ui.label("Folder:");
+            ui.label("Input:");
             let current = self
-                .selected_folder
-                .and_then(|i| self.folders.get(i))
+                .selected_input
+                .and_then(|i| self.inputs.get(i))
                 .map(|p| folder_label(p))
-                .unwrap_or_else(|| "— select a folder —".to_owned());
+                .unwrap_or_else(|| "— select an input —".to_owned());
             let mut clicked = None;
-            egui::ComboBox::from_id_salt("folder")
+            egui::ComboBox::from_id_salt("input")
                 .selected_text(current)
                 .width(320.0)
                 .show_ui(ui, |ui| {
-                    for (i, f) in self.folders.iter().enumerate() {
+                    for (i, f) in self.inputs.iter().enumerate() {
                         if ui
-                            .selectable_label(self.selected_folder == Some(i), folder_label(f))
+                            .selectable_label(self.selected_input == Some(i), folder_label(f))
                             .on_hover_text(f.display().to_string())
                             .clicked()
                         {
@@ -655,8 +773,8 @@ impl CropApp {
                     }
                 });
             if let Some(i) = clicked {
-                if self.selected_folder != Some(i) {
-                    self.select_folder(i, &ctx);
+                if self.selected_input != Some(i) {
+                    self.select_input(i, &ctx);
                 }
             }
 
@@ -784,29 +902,40 @@ impl CropApp {
             // Save buttons sit at the far right; lay them out first so the
             // status text on the left can take the remaining width.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let can_save = self.crop_px().is_some();
-                if let Some(out) = self.output_path.clone() {
-                    let (label, hover) = if self.called_from_python {
+                let can_save = self.crop_px().is_some() && self.saving_rx.is_none();
+
+                // Save-and-quit / return-to-caller button, when there is
+                // somewhere for the result to go.
+                if self.called_from_app || self.output_path.is_some() {
+                    let mut sends = Vec::new();
+                    match &self.output_path {
+                        Some(p) => sends.push(format!("crop → {}", p.display())),
+                        None if self.called_from_app => sends.push("crop → stdout".to_owned()),
+                        None => {}
+                    }
+                    if let Some(p) = &self.output_stack {
+                        sends.push(format!("cropped 3-D stack (.npy) → {}", p.display()));
+                    }
+                    let (label, hover) = if self.called_from_app {
                         (
                             "↩ Return to main application",
                             format!(
-                                "Return the crop to the calling application (written to {}) and close",
-                                out.display()
+                                "Return the result to the calling application ({}) and close",
+                                sends.join(", ")
                             ),
                         )
                     } else {
                         (
                             "✅ Save crop & quit",
-                            format!("Write the crop to {} and close", out.display()),
+                            format!("Write the result ({}) and close", sends.join(", ")),
                         )
                     };
                     if ui
                         .add_enabled(can_save, egui::Button::new(label))
                         .on_hover_text(hover)
                         .clicked()
-                        && self.write_crop(&out)
                     {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        self.save_and_quit();
                     }
                 }
                 if ui
@@ -815,6 +944,19 @@ impl CropApp {
                     .clicked()
                 {
                     self.save_crop_dialog();
+                }
+                if ui
+                    .add_enabled(can_save, egui::Button::new("🗋 Save cropped stack as…"))
+                    .on_hover_text(
+                        "Write the cropped 3-D stack as a NumPy .npy file \
+                         (float32, shape (n_images, height, width))",
+                    )
+                    .clicked()
+                {
+                    self.save_stack_dialog();
+                }
+                if self.saving_rx.is_some() {
+                    ui.spinner();
                 }
                 ui.separator();
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -1434,6 +1576,7 @@ impl eframe::App for CropApp {
         let ctx = ui.ctx().clone();
         self.poll_load();
         self.poll_stats();
+        self.poll_saving(&ctx);
         self.maybe_spawn_stats(&ctx);
         self.animate(&ctx);
         if self.loading.is_some() {

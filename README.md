@@ -1,12 +1,14 @@
 # Crop TIFF
 
 Native GUI (Rust, [egui](https://github.com/emilk/egui)) to pick a **single
-rectangular crop region** on a stack of TIFF images and export it as a small
-JSON file, so the calling application (e.g. a marimo notebook) can crop the
-stack **before** loading it and drastically reduce memory / processing time.
+rectangular crop region** on a stack of images (a folder of TIFFs or a `.npy`
+stack) and export it as a small JSON file — and optionally the **cropped 3-D
+stack itself** as `.npy` — so the calling application (e.g.
+rust_ct_reconstruction or a marimo notebook) can work on the reduced stack and
+drastically cut memory / processing time.
 
-Started from [rust_tiff_viewer](../rust_tiff_viewer); companion tool for the
-VENUS marimo notebooks, and usable standalone.
+Started from [rust_tiff_viewer](../rust_tiff_viewer); companion tool for
+rust_ct_reconstruction and the VENUS marimo notebooks, and usable standalone.
 
 ## Build
 
@@ -18,7 +20,7 @@ cargo build --release
 ## Usage
 
 ```bash
-# Standalone: open a folder from within the app
+# Standalone: open a folder or .npy stack from within the app
 crop_tiff
 
 # Display a folder of TIFF images
@@ -28,26 +30,41 @@ crop_tiff /SNS/VENUS/IPTS-XXXX/.../Run_YYYY
 crop_tiff --crop 100,200,512,512 /path/to/run
 crop_tiff --crop-file previous_crop.json /path/to/run
 
-# Driven by a notebook that waits for the crop
-crop_tiff /path/to/run --output crop.json --called-from-python \
+# Driven by another application (e.g. rust_ct_reconstruction) that hands its
+# loaded stack over as a 3-D .npy and waits for the cropped stack back
+crop_tiff stack.npy --called-from-app \
+    --output crop.json --output-stack cropped_stack.npy \
     --instructions "Adjust the crop so the sample stays inside at every angle."
 ```
 
-- **FOLDER** — folder(s) of TIFF images (multi-page supported). More folders
-  can be added from within the application; a crop drawn on one folder is kept
-  when switching to another folder with the same image size.
+- **INPUT** — folder(s) of TIFF images (multi-page supported) and/or `.npy`
+  stack files: a 2-D array is one image, a 3-D array one image per plane along
+  axis 0 (the form used when another application hands its loaded stack over).
+  More inputs can be added from within the application (**📁 Add folder…**,
+  **🗋 Add .npy…**); a crop drawn on one input is kept when switching to
+  another input with the same image size.
 - **`-o, --output <PATH>`** — enables the **✅ Save crop & quit** button, which
   writes the crop JSON to `PATH` and closes the app.
+- **`--output-stack <PATH.npy>`** — also write the **cropped 3-D stack** when
+  saving/returning: NumPy `.npy`, `float32`, shape
+  `(n_images, height, width)`. Written on a background thread (the stack can
+  be GBs); the window closes when it is done.
 - **`-c, --crop <X,Y,W,H>`** — initial crop region (e.g. the crop used last
   time), shown on the image at startup and kept as a dashed orange reference
   outline while you adjust the live (green) crop. **`--crop-file <PATH>`**
   reads the same thing from a JSON file written by a previous session.
-- **`--called-from-python`** — the save button reads **↩ Return to main
-  application** instead: it writes the crop to `--output` (required) and
-  closes the window so the blocked caller resumes.
+- **`--called-from-app`** — the app is driven by another application that is
+  blocked waiting for the crop: the save button reads **↩ Return to main
+  application** instead (the rust_tof_profile_viewer convention). It writes
+  the crop JSON to `--output` — or prints it on **stdout** when no `--output`
+  is given, for a caller that captures the child's output — writes the
+  cropped stack to `--output-stack` when given, and closes the window so the
+  caller resumes. `--called-from-python` and `--called-from-marimo` are
+  accepted as synonyms.
 - **`--instructions <TEXT>`** — shows `TEXT` in a modal dialog at startup;
   reopen with the **ℹ Instructions** toolbar button.
-- Without `--output`, use **💾 Save crop as…** to pick the destination.
+- Without `--output`, use **💾 Save crop as…** / **🗋 Save cropped stack as…**
+  to pick the destinations.
 
 ## Output format
 
@@ -67,6 +84,10 @@ crop_tiff /path/to/run --output crop.json --called-from-python \
 so in Python the crop is simply `frame[y:y+height, x:x+width]`. Only the four
 `x/y/width/height` keys are read back by `--crop-file`; the rest records what
 the crop was drawn on.
+
+With `--output-stack`, the cropped stack itself is returned as a `.npy` file:
+`float32`, shape `(n_images, height, width)` — in Rust readable with
+`ndarray-npy`, in Python with `numpy.load`.
 
 ## Drawing the crop
 
