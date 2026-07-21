@@ -1,0 +1,19 @@
+[package]
+name = "rust_crop_tiff"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "crop_tiff"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+colorgrad = { version = "0.8", features = ["preset"] }
+eframe = "0.35"
+egui = "0.35"
+egui_plot = "0.36"
+ndarray = "0.17"
+rayon = "1.10"
+rfd = "0.17"
+tiff = "0.11"
