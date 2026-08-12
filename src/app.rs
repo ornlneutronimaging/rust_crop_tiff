@@ -857,6 +857,9 @@ impl CropApp {
                     self.show_instructions = true;
                 }
             }
+
+            ui.separator();
+            crate::theme::toggle_button(ui);
         });
 
         ui.horizontal_wrapped(|ui| {

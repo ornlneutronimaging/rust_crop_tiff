@@ -10,3 +10,4 @@ pub mod colormap;
 pub mod crop;
 pub mod loader;
 pub mod stats;
+pub mod theme;

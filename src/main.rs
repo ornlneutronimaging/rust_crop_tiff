@@ -176,8 +176,9 @@ fn main() -> eframe::Result<()> {
         "VENUS Crop TIFF",
         native_options,
         Box::new(move |cc| {
-            // Always use the dark theme, regardless of the system/desktop theme.
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
+            // Saved light/dark preference, shared by all the VENUS rust
+            // tools (dark when none is saved); the toolbar has a toggle.
+            cc.egui_ctx.set_theme(rust_crop_tiff::theme::load());
             let mut app = CropApp::new(
                 args.inputs,
                 args.initial_crop,
