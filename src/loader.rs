@@ -290,6 +290,96 @@ pub fn write_cropped_stack(path: &Path, frames: &[Array2<f32>], crop: CropRect) 
         .with_context(|| format!("write cropped stack {}", path.display()))
 }
 
+/// Apply `crop` to every frame and write them as individual float32 TIFF
+/// files into `dest` (created if needed). When the input was a folder whose
+/// TIFF files map 1:1 onto the frames, the original file names are kept so
+/// downstream tools and the spectra file still line up; otherwise the frames
+/// are numbered after the input's stem. Any `*_Spectra.txt` file next to the
+/// input is copied along. Returns status notes for the UI.
+pub fn export_cropped_images(dest: &Path, data: &FolderData, crop: CropRect) -> Result<Vec<String>> {
+    if data.path.is_dir() && dest == data.path {
+        bail!("Export folder must be different from the input folder");
+    }
+    std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+
+    // Keep the original file names when they map 1:1 onto the frames.
+    let from_files: Option<Vec<String>> = if data.path.is_dir() {
+        list_tiff_in_dir(&data.path).ok().and_then(|paths| {
+            (paths.len() == data.frames.len()).then(|| {
+                paths
+                    .iter()
+                    .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                    .collect()
+            })
+        })
+    } else {
+        None
+    };
+    let names: Vec<String> = from_files.unwrap_or_else(|| {
+        let stem = data
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "cropped".to_owned());
+        (0..data.frames.len())
+            .map(|i| format!("{stem}_{i:05}.tiff"))
+            .collect()
+    });
+
+    data.frames
+        .par_iter()
+        .zip(names.par_iter())
+        .try_for_each(|(frame, name)| -> Result<()> {
+            let path = dest.join(name);
+            let cropped = frame.slice(s![crop.y..crop.y1(), crop.x..crop.x1()]);
+            let values: Vec<f32> = cropped.iter().copied().collect();
+            let file = std::fs::File::create(&path)
+                .with_context(|| format!("create {}", path.display()))?;
+            let mut enc = tiff::encoder::TiffEncoder::new(std::io::BufWriter::new(file))
+                .with_context(|| format!("encode TIFF {}", path.display()))?;
+            enc.write_image::<tiff::encoder::colortype::Gray32Float>(
+                crop.width as u32,
+                crop.height as u32,
+                &values,
+            )
+            .with_context(|| format!("write {}", path.display()))?;
+            Ok(())
+        })?;
+
+    let mut notes = vec![format!(
+        "{} cropped images ({}×{} px) → {}",
+        data.frames.len(),
+        crop.width,
+        crop.height,
+        dest.display()
+    )];
+
+    // Copy the spectra file(s) of a folder input along with the images.
+    if data.path.is_dir() {
+        let mut copied = 0usize;
+        for entry in std::fs::read_dir(&data.path)? {
+            let path = entry?.path();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
+            if path.is_file() && name.ends_with("_spectra.txt") {
+                let to = dest.join(path.file_name().unwrap_or_default());
+                std::fs::copy(&path, &to)
+                    .with_context(|| format!("copy {} to {}", path.display(), to.display()))?;
+                copied += 1;
+                notes.push(format!("spectra file → {}", to.display()));
+            }
+        }
+        if copied == 0 {
+            notes.push("no *_Spectra.txt file found to copy".to_owned());
+        }
+    }
+
+    Ok(notes)
+}
+
 /// Read every page of a (possibly multi-page) TIFF file.
 fn load_tiff(path: &Path) -> Result<Vec<Array2<f32>>> {
     use tiff::decoder::{Decoder, DecodingResult};
@@ -405,6 +495,35 @@ mod tests {
         assert_eq!((data.width, data.height), (4, 3));
         assert_eq!(data.frames[1][(2, 3)], 123.0);
         assert_eq!(data.sum[(0, 1)], 1.0 + 101.0);
+    }
+
+    #[test]
+    fn export_writes_cropped_tiffs_and_copies_spectra() {
+        let dir = tmp_dir("export_src");
+        write_tiff_u16(&dir.join("img_00000.tif"), 6, 5, 5);
+        write_tiff_u16(&dir.join("img_00001.tif"), 6, 5, 7);
+        std::fs::write(dir.join("run_Spectra.txt"), "tof,counts\n").unwrap();
+
+        let data = load_folder_with_progress(&dir, |_, _| {}).unwrap();
+        let crop = CropRect {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 2,
+        };
+        let dest = tmp_dir("export_dst");
+        let notes = export_cropped_images(&dest, &data, crop).unwrap();
+        assert!(notes.iter().any(|n| n.contains("2 cropped images")));
+        assert!(notes.iter().any(|n| n.contains("spectra file")));
+
+        // Original names kept, spectra copied.
+        assert!(dest.join("run_Spectra.txt").is_file());
+        let frames = load_tiff(&dest.join("img_00001.tif")).unwrap();
+        assert_eq!(frames[0].shape(), &[2, 3]);
+        assert_eq!(frames[0][(0, 0)], 7.0);
+
+        // Exporting onto the input folder must be refused.
+        assert!(export_cropped_images(&dir, &data, crop).is_err());
     }
 
     #[test]

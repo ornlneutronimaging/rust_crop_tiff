@@ -65,9 +65,15 @@ crop_tiff stack.npy --called-from-app \
   `--called-from-python` and `--called-from-marimo` are accepted as synonyms.
 - **`--instructions <TEXT>`** — shows `TEXT` in a modal dialog at startup;
   reopen with the **ℹ Instructions** toolbar button.
-- Without `--output`, use **💾 Save crop as…** / **🗋 Save cropped stack as…**
-  to pick the destinations; saving a cropped stack interactively also writes
-  its `<stem>_crop.json` sidecar.
+- Without `--output`, use **💾 Save as JSON…** (crop region) / **🗋 Save as
+  NumPy array…** (cropped 3-D stack) to pick the destinations; saving a
+  cropped stack interactively also writes its `<stem>_crop.json` sidecar.
+- **🗀 Export cropped stack…** applies the crop to every image and writes them
+  as individual float32 TIFF files (keeping the original file names) into a
+  new folder created inside the folder you pick, named
+  `<input>_crop_x0<x0>_y0<y0>_x1<x1>_y1<y1>` (exclusive stops). The input
+  folder's `*_Spectra.txt` file is copied along and a `crop_region.json` is
+  dropped in the folder.
 
 ## Output format
 

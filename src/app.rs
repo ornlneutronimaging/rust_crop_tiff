@@ -145,6 +145,11 @@ pub struct CropApp {
     /// the single-image entry spans all frames so the contrast stays put while
     /// sliding through them.
     ranges: [(f32, f32); 6],
+    /// Sigma-clipped range of each display mode, used as the auto contrast:
+    /// the dense bulk of the values. Normalized transmission stacks have
+    /// outlier ratios that would otherwise stretch the contrast to the camera
+    /// range and make the image look flat.
+    auto_ranges: [(f32, f32); 6],
     data_min: f32,
     data_max: f32,
     vmin: f32,
@@ -218,6 +223,7 @@ impl CropApp {
             mode: DisplayMode::Integrated,
             frame_idx: 0,
             ranges: [(0.0, 1.0); 6],
+            auto_ranges: [(0.0, 1.0); 6],
             data_min: 0.0,
             data_max: 1.0,
             vmin: 0.0,
@@ -366,6 +372,14 @@ impl CropApp {
             normalize_range(raw_range(data.std.iter().copied())),
             normalize_range(frames_range),
         ];
+        self.auto_ranges = [
+            robust_range(std::slice::from_ref(&data.sum), self.ranges[0]),
+            robust_range(std::slice::from_ref(&data.mean), self.ranges[1]),
+            robust_range(std::slice::from_ref(&data.max), self.ranges[2]),
+            robust_range(std::slice::from_ref(&data.min), self.ranges[3]),
+            robust_range(std::slice::from_ref(&data.std), self.ranges[4]),
+            robust_range(&data.frames, self.ranges[5]),
+        ];
         self.frame_idx = self.frame_idx.min(data.n_frames() - 1);
         self.apply_active_range();
 
@@ -483,13 +497,15 @@ impl CropApp {
         }
     }
 
-    /// Reset the contrast limits to the full range of the displayed mode.
+    /// Reset the contrast limits to the auto (sigma-clipped) range of the
+    /// displayed mode, and the manual edit bounds to its full range.
     fn apply_active_range(&mut self) {
         let (lo, hi) = self.ranges[self.mode.index()];
         self.data_min = lo;
         self.data_max = hi;
-        self.vmin = lo;
-        self.vmax = hi;
+        let (alo, ahi) = self.auto_ranges[self.mode.index()];
+        self.vmin = alo;
+        self.vmax = ahi;
         self.img_dirty = true;
     }
 
@@ -682,6 +698,64 @@ impl CropApp {
         );
     }
 
+    fn export_folder_dialog(&mut self) {
+        let Some(dest) = rfd::FileDialog::new()
+            .set_title("Export the cropped images — pick where the new folder is created")
+            .pick_folder()
+        else {
+            return;
+        };
+        self.start_export(dest);
+    }
+
+    /// Apply the crop to every image and write them as individual TIFF files
+    /// into a new folder inside `parent`, named after the input and the crop
+    /// bounds (`<input>_crop_x0<x0>_y0<y0>_x1<x1>_y1<y1>`, exclusive stops),
+    /// with the spectra file copied along and a `crop_region.json` sidecar —
+    /// on a background thread.
+    fn start_export(&mut self, parent: PathBuf) {
+        if self.saving_rx.is_some() {
+            return;
+        }
+        let (Some(data), Some(crop)) = (self.data.clone(), self.crop_px()) else {
+            self.status = "Nothing to export — draw a crop region first.".to_owned();
+            return;
+        };
+        let stem = if data.path.is_dir() {
+            data.path.file_name()
+        } else {
+            data.path.file_stem()
+        }
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cropped".to_owned());
+        let dest = parent.join(format!(
+            "{stem}_crop_x0{}_y0{}_x1{}_y1{}",
+            crop.x,
+            crop.y,
+            crop.x1(),
+            crop.y1()
+        ));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.saving_rx = Some(rx);
+        self.close_after_save = false;
+        self.status = format!("Exporting the cropped images to {}…", dest.display());
+
+        std::thread::spawn(move || {
+            let result = (|| -> Result<String, String> {
+                let mut notes = loader::export_cropped_images(&dest, &data, crop)
+                    .map_err(|e| format!("Export failed: {e:#}"))?;
+                let json = crop.to_json(data.width, data.height, &data.path.display().to_string());
+                let json_path = dest.join("crop_region.json");
+                std::fs::write(&json_path, &json)
+                    .map_err(|e| format!("Failed to write {}: {e}", json_path.display()))?;
+                notes.push(format!("crop → {}", json_path.display()));
+                Ok(format!("Exported: {}", notes.join(", ")))
+            })();
+            let _ = tx.send(result);
+        });
+    }
+
     // ----- instructions modal ----------------------------------------------
 
     /// Modal shown on top of the application when the caller passed
@@ -826,7 +900,18 @@ impl CropApp {
                     .range(range.clone()),
             );
             let r2 = ui.add(egui::DragValue::new(&mut self.vmax).speed(speed).range(range));
-            if ui.button("Auto").clicked() {
+            if ui
+                .button("Auto")
+                .on_hover_text("Range of the bulk of the data, ignoring outlier pixels")
+                .clicked()
+            {
+                self.apply_active_range();
+            }
+            if ui
+                .button("Full")
+                .on_hover_text("Full min–max range, outliers included")
+                .clicked()
+            {
                 self.vmin = self.data_min;
                 self.vmax = self.data_max;
                 self.img_dirty = true;
@@ -969,14 +1054,14 @@ impl CropApp {
                     }
                 }
                 if ui
-                    .add_enabled(can_save, egui::Button::new("💾 Save crop as…"))
+                    .add_enabled(can_save, egui::Button::new("💾 Save as JSON…"))
                     .on_hover_text("Write the crop region (x, y, width, height) to a JSON file")
                     .clicked()
                 {
                     self.save_crop_dialog();
                 }
                 if ui
-                    .add_enabled(can_save, egui::Button::new("🗋 Save cropped stack as…"))
+                    .add_enabled(can_save, egui::Button::new("🗋 Save as NumPy array…"))
                     .on_hover_text(
                         "Write the cropped 3-D stack as a NumPy .npy file \
                          (float32, shape (n_images, height, width))",
@@ -984,6 +1069,17 @@ impl CropApp {
                     .clicked()
                 {
                     self.save_stack_dialog();
+                }
+                if ui
+                    .add_enabled(can_save, egui::Button::new("🗀 Export cropped stack…"))
+                    .on_hover_text(
+                        "Apply the crop to every image and write them as individual \
+                         TIFF files (float32) into a new folder named after the \
+                         input and the crop bounds, copying the spectra file along",
+                    )
+                    .clicked()
+                {
+                    self.export_folder_dialog();
                 }
                 if self.saving_rx.is_some() {
                     ui.spinner();
@@ -1526,6 +1622,81 @@ fn normalize_range((lo, hi): (f32, f32)) -> (f32, f32) {
         (lo, hi)
     } else {
         (0.0, 1.0)
+    }
+}
+
+/// Number of values `robust_range` samples across the frames.
+const AUTO_SAMPLES: usize = 1 << 20;
+/// Sigma-clip width: the auto range is the clipped mean ± this many standard
+/// deviations.
+const AUTO_K: f64 = 3.0;
+/// Never clip the auto range below this fraction of the sampled values.
+const AUTO_MIN_COVER: f64 = 0.5;
+
+/// Auto-contrast range by iterative sigma clipping: repeatedly narrow the
+/// range to mean ± `AUTO_K`·σ of the values inside it until it stops moving.
+/// A dense bulk plus a sparse tail — e.g. normalized 0–1 data whose failed
+/// ratios reach 65535 — converges to the bulk, while well-behaved data
+/// (Gaussian, uniform, bimodal) is left essentially untouched. Works on a
+/// strided sample of the finite values; falls back to `full` when the sample
+/// is too small or the range collapses.
+fn robust_range(frames: &[Array2<f32>], full: (f32, f32)) -> (f32, f32) {
+    use rayon::prelude::*;
+
+    let per_frame = (AUTO_SAMPLES / frames.len().max(1)).max(1);
+    let sample: Vec<f32> = frames
+        .par_iter()
+        .flat_map_iter(|f| match f.as_slice() {
+            Some(s) => {
+                let stride = (s.len() / per_frame).max(1);
+                s.iter()
+                    .copied()
+                    .step_by(stride)
+                    .filter(|v| v.is_finite())
+                    .collect::<Vec<_>>()
+            }
+            None => f.iter().copied().filter(|v| v.is_finite()).collect(),
+        })
+        .collect();
+    if sample.len() < 100 {
+        return full;
+    }
+    let n = sample.len() as f64;
+    let (mut lo, mut hi) = full;
+    for _ in 0..40 {
+        let (mut cnt, mut sum, mut sum2) = (0u64, 0f64, 0f64);
+        for &v in &sample {
+            if v >= lo && v <= hi {
+                let v = v as f64;
+                cnt += 1;
+                sum += v;
+                sum2 += v * v;
+            }
+        }
+        if cnt < 100 {
+            break;
+        }
+        let mean = sum / cnt as f64;
+        let sigma = (sum2 / cnt as f64 - mean * mean).max(0.0).sqrt();
+        let nlo = ((mean - AUTO_K * sigma) as f32).max(full.0);
+        let nhi = ((mean + AUTO_K * sigma) as f32).min(full.1);
+        if nlo >= nhi {
+            break;
+        }
+        let inside = sample.iter().filter(|v| (nlo..=nhi).contains(v)).count();
+        if (inside as f64) < AUTO_MIN_COVER * n {
+            break;
+        }
+        if nlo == lo && nhi == hi {
+            break;
+        }
+        lo = nlo;
+        hi = nhi;
+    }
+    if lo < hi {
+        (lo, hi)
+    } else {
+        full
     }
 }
 
