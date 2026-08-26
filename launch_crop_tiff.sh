@@ -26,12 +26,25 @@ fi
 if $needs_build; then
     CARGO="$(command -v cargo || true)"
     [[ -z "$CARGO" && -x "$HOME/.cargo/bin/cargo" ]] && CARGO="$HOME/.cargo/bin/cargo"
-    if [[ -z "$CARGO" ]]; then
-        echo "Error: binary is out of date and cargo was not found to rebuild it." >&2
+    if [[ -n "$CARGO" && -w "$REPO_DIR/target" ]]; then
+        echo "Building crop_tiff (release)..."
+        (cd "$REPO_DIR" && "$CARGO" build --release)
+        # cargo does not relink (or touch) an already up-to-date binary, so
+        # advance its mtime explicitly — otherwise the staleness check above
+        # keeps firing forever, locking out users who cannot rebuild.
+        touch "$BINARY"
+    elif [[ -x "$BINARY" ]]; then
+        # Regular users have no cargo and no write access to the repo: a
+        # possibly stale binary is better than none. The owner's next
+        # launch rebuilds it.
+        echo "Warning: sources are newer than the binary but it cannot be" \
+             "rebuilt here (cargo missing or target/ not writable);" \
+             "launching the existing binary." >&2
+    else
+        echo "Error: no binary found and it cannot be built here" \
+             "(cargo missing or target/ not writable)." >&2
         exit 1
     fi
-    echo "Building crop_tiff (release)..."
-    (cd "$REPO_DIR" && "$CARGO" build --release)
 fi
 
 exec "$BINARY" "$@"
