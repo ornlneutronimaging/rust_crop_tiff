@@ -1100,6 +1100,20 @@ impl CropApp {
     /// The right-hand panel: crop coordinates, size summary, and the per-frame
     /// verification plot.
     fn crop_panel(&mut self, ui: &mut egui::Ui) {
+        // The plot adapts to the window, but the crop fields, the
+        // verification text and the plot's minimum height can outgrow a short
+        // window (small displays, the large-text mode). The panel height is
+        // measured before entering the scroll area — inside it the available
+        // height is unbounded — and the plot's minimum height below is what
+        // makes the scroll bar appear.
+        let panel_h = ui.available_height();
+        egui::ScrollArea::vertical()
+            .id_salt("crop_panel_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.crop_panel_content(ui, panel_h));
+    }
+
+    fn crop_panel_content(&mut self, ui: &mut egui::Ui, panel_h: f32) {
         ui.set_min_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.heading("Crop region");
@@ -1219,7 +1233,9 @@ impl CropApp {
             .x_axis_label("file index")
             .y_axis_label("mean counts / pixel")
             .legend(Legend::default())
-            .height(ui.available_height().max(200.0));
+            .height(
+                (panel_h - ui.min_rect().height() - ui.spacing().item_spacing.y).max(200.0),
+            );
 
         let mut clicked_x: Option<f64> = None;
         plot.show(ui, |plot_ui| {
@@ -1304,6 +1320,20 @@ impl CropApp {
             });
             return;
         };
+        // The image viewport adapts to the window, but its minimum height
+        // plus the image slider can outgrow a short window (small displays,
+        // the large-text mode). The panel height is measured before entering
+        // the scroll area — inside it the available height is unbounded —
+        // and the viewport's minimum height below is what makes the scroll
+        // bar appear.
+        let panel_h = ui.available_height();
+        egui::ScrollArea::vertical()
+            .id_salt("viewer_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.viewer_content(ui, &data, panel_h));
+    }
+
+    fn viewer_content(&mut self, ui: &mut egui::Ui, data: &FolderData, panel_h: f32) {
         let (w, h) = (data.width, data.height);
 
         // In single-image mode a slider at the bottom picks the image on screen.
@@ -1316,13 +1346,14 @@ impl CropApp {
 
         if self.fit_requested && w > 0 && h > 0 {
             let avail = ui.available_size();
-            let s = (avail.x / w as f32).min((avail.y - slider_height).max(1.0) / h as f32);
+            let s = (avail.x / w as f32)
+                .min((panel_h - slider_height).max(1.0) / h as f32);
             self.scale = s.clamp(0.02, 64.0);
             self.fit_requested = false;
         }
 
         egui::ScrollArea::both()
-            .max_height((ui.available_height() - slider_height).max(0.0))
+            .max_height((panel_h - slider_height).max(120.0))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let size = egui::vec2(w as f32 * self.scale, h as f32 * self.scale);
