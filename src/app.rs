@@ -945,6 +945,7 @@ impl CropApp {
 
             ui.separator();
             crate::theme::toggle_button(ui);
+            crate::zoom::toggle_button(ui);
         });
 
         ui.horizontal_wrapped(|ui| {

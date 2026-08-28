@@ -179,6 +179,7 @@ fn main() -> eframe::Result<()> {
             // Saved light/dark preference, shared by all the VENUS rust
             // tools (dark when none is saved); the toolbar has a toggle.
             cc.egui_ctx.set_theme(rust_crop_tiff::theme::load());
+            cc.egui_ctx.set_zoom_factor(rust_crop_tiff::zoom::load());
             let mut app = CropApp::new(
                 args.inputs,
                 args.initial_crop,
