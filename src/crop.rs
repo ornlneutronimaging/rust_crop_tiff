@@ -5,6 +5,17 @@
 //! Two representations: [`RectF`] is the free-floating rectangle being drawn
 //! or dragged on screen; [`CropRect`] is the integer region actually saved and
 //! used for statistics, always clamped inside the image.
+//!
+//! Coordinate frames: on screen the crop is drawn on the *oriented* frames
+//! (Timepix stacks are transposed on load, CCD stacks flipped vertically —
+//! see [`detector_orientation`]). The JSON handed to other applications, the
+//! `--crop` / `--crop-file` inputs and every cropped file written to disk are
+//! in the **on-disk** frame of the input files, so a caller can slice the
+//! original files with `frame[y:y+height, x:x+width]` without knowing about
+//! the display orientation. [`CropRect::to_disk`] / [`CropRect::from_disk`]
+//! convert between the two.
+
+use detector_orientation::{Detector, Orientation};
 
 /// A floating-point rectangle in image-pixel space, as edited on screen.
 /// Corners may be in any order and outside the image; [`RectF::to_crop`]
@@ -77,6 +88,22 @@ impl CropRect {
         }
     }
 
+    /// This crop, drawn on frames oriented by `orientation` (oriented image
+    /// size `img_w × img_h`), expressed in the on-disk frame of the files.
+    pub fn to_disk(self, orientation: Orientation, img_w: usize, img_h: usize) -> CropRect {
+        let (x0, y0, x1, y1) =
+            orientation.to_disk_rect(self.x, self.y, self.x1(), self.y1(), img_w, img_h);
+        CropRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
+    }
+
+    /// A crop given in the on-disk frame of the files (on-disk image size
+    /// `disk_w × disk_h`), expressed on the oriented frames.
+    pub fn from_disk(self, orientation: Orientation, disk_w: usize, disk_h: usize) -> CropRect {
+        let (x0, y0, x1, y1) =
+            orientation.from_disk_rect(self.x, self.y, self.x1(), self.y1(), disk_w, disk_h);
+        CropRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
+    }
+
     /// One past the right-most column.
     pub fn x1(&self) -> usize {
         self.x + self.width
@@ -137,9 +164,22 @@ impl CropRect {
         })
     }
 
-    /// The JSON written by the save button. `image_width`/`image_height` and
-    /// `folder` record what the crop was drawn on.
-    pub fn to_json(&self, img_w: usize, img_h: usize, folder: &str) -> String {
+    /// The JSON written by the save button, for a crop drawn on the oriented
+    /// frames (oriented image size `img_w × img_h`).
+    ///
+    /// `x`/`y`/`width`/`height` and `image_width`/`image_height` are in the
+    /// **on-disk** frame of the input files (what every caller slices);
+    /// `detector`/`orientation` record how the frames were shown, and the
+    /// `display_*` keys repeat the crop as drawn, for information. `folder`
+    /// is the input the crop was drawn on.
+    pub fn to_json(
+        &self,
+        img_w: usize,
+        img_h: usize,
+        folder: &str,
+        detector: Detector,
+        orientation: Orientation,
+    ) -> String {
         let escaped: String = folder
             .chars()
             .flat_map(|c| match c {
@@ -147,15 +187,30 @@ impl CropRect {
                 _ => vec![c],
             })
             .collect();
+        let disk = self.to_disk(orientation, img_w, img_h);
+        let (disk_w, disk_h) = orientation.dims(img_w, img_h);
         format!(
             "{{\n  \"x\": {},\n  \"y\": {},\n  \"width\": {},\n  \"height\": {},\n  \
-             \"image_width\": {img_w},\n  \"image_height\": {img_h},\n  \"folder\": \"{escaped}\"\n}}\n",
-            self.x, self.y, self.width, self.height
+             \"image_width\": {disk_w},\n  \"image_height\": {disk_h},\n  \"folder\": \"{escaped}\",\n  \
+             \"detector\": \"{}\",\n  \"orientation\": \"{}\",\n  \
+             \"display_x\": {},\n  \"display_y\": {},\n  \"display_width\": {},\n  \"display_height\": {},\n  \
+             \"display_image_width\": {img_w},\n  \"display_image_height\": {img_h}\n}}\n",
+            disk.x,
+            disk.y,
+            disk.width,
+            disk.height,
+            detector.label(),
+            orientation.label(),
+            self.x,
+            self.y,
+            self.width,
+            self.height,
         )
     }
 
     /// Read a crop back from JSON text: only the `x`, `y`, `width` and
-    /// `height` keys are used, so files from other tools work too.
+    /// `height` keys (on-disk frame) are used, so files from other tools work
+    /// too.
     pub fn from_json_text(text: &str) -> Result<CropRect, String> {
         let get = |key: &str| -> Result<usize, String> {
             json_uint(text, key).ok_or_else(|| format!("no numeric \"{key}\" field found"))
@@ -248,7 +303,7 @@ mod tests {
             width: 70,
             height: 80,
         };
-        let json = c.to_json(2048, 2048, "/some/\"quoted\"/run_1");
+        let json = c.to_json(2048, 2048, "/some/\"quoted\"/run_1", Detector::Unknown, Orientation::Identity);
         assert_eq!(CropRect::from_json_text(&json).unwrap(), c);
     }
 

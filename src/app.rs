@@ -6,7 +6,7 @@
 
 use crate::colormap::Colormap;
 use crate::crop::{CropRect, RectF};
-use crate::loader::{self, FolderData};
+use crate::loader::{self, Detector, FolderData, Selection};
 use crate::stats::{self, CropStats};
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions};
@@ -164,11 +164,18 @@ pub struct CropApp {
     last_advance: Option<Instant>,
     dim_outside: bool,
 
-    // Crop model.
+    // Crop model (all in the oriented/display frame of the loaded stack).
     crop: Option<RectF>,
-    /// Crop passed on the command line (a previous session's crop), kept as a
-    /// dashed reference outline.
+    /// Crop passed on the command line (a previous session's crop), in the
+    /// on-disk frame of the files; shown as [`CropApp::initial_crop`].
+    initial_crop_disk: Option<CropRect>,
+    /// [`CropApp::initial_crop_disk`] on the oriented frames of the loaded
+    /// stack, kept as a dashed reference outline.
     initial_crop: Option<CropRect>,
+    /// Detector chosen by the user (toolbar combobox / `--detector`), which
+    /// decides how the frames are oriented on load; `None` = guess it from
+    /// the folder layout.
+    detector_override: Option<Detector>,
     undo: Vec<Option<RectF>>,
 
     // Interaction transients.
@@ -238,7 +245,9 @@ impl CropApp {
             last_advance: None,
             dim_outside: true,
             crop: None,
-            initial_crop,
+            initial_crop_disk: initial_crop,
+            initial_crop: None,
+            detector_override: None,
             undo: Vec::new(),
             drawing: false,
             moving: false,
@@ -259,6 +268,73 @@ impl CropApp {
             show_instructions: instructions.is_some(),
             instructions,
             status,
+        }
+    }
+
+    /// Force the detector (hence the orientation) of every input, `None` to
+    /// go back to the automatic guess (the `--detector` command-line option).
+    pub fn set_detector_override(&mut self, detector: Option<Detector>) {
+        self.detector_override = detector;
+    }
+
+    /// Detector to load `path` with: the user's override, else the folder
+    /// layout (`images/tpx1`, `images/ikonxl`, …).
+    fn detector_for(&self, path: &Path) -> Selection {
+        let mut sel = Selection::from_path(path);
+        sel.manual = self.detector_override;
+        sel
+    }
+
+    /// Toolbar combobox choosing the detector (hence the orientation on
+    /// load): "auto" follows the folder layout, the other entries force one.
+    /// Changing it reloads the displayed input.
+    fn detector_combo(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label("Detector:").on_hover_text(
+            "How the frames are oriented on load: Timepix → transposed, CCD → flipped \
+             vertically, QHY → not decided yet (as-is). 'auto' recognizes the detector from \
+             the folder layout (images/tpx1, images/ikonxl, …). The crop is drawn on the \
+             oriented image; the saved crop and every cropped file are in the on-disk frame \
+             of the input files.",
+        );
+        let auto_text = match self.data.as_ref() {
+            Some(d) if d.detector.is_auto() => format!("auto: {}", d.detector.summary()),
+            _ => "auto".to_owned(),
+        };
+        let current = match self.detector_override {
+            None => auto_text.clone(),
+            Some(d) => d.label().to_owned(),
+        };
+        let mut changed = false;
+        egui::ComboBox::from_id_salt("detector")
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(self.detector_override.is_none(), auto_text)
+                    .on_hover_text("Guess the detector from the folder layout")
+                    .clicked()
+                    && self.detector_override.is_some()
+                {
+                    self.detector_override = None;
+                    changed = true;
+                }
+                for d in Detector::ALL {
+                    if ui
+                        .selectable_label(self.detector_override == Some(d), d.label())
+                        .on_hover_text(d.description())
+                        .clicked()
+                        && self.detector_override != Some(d)
+                    {
+                        self.detector_override = Some(d);
+                        changed = true;
+                    }
+                }
+            });
+        if let Some(d) = self.data.as_ref() {
+            ui.label(egui::RichText::new(d.orientation.label()).weak())
+                .on_hover_text(d.detector.detector().description());
+        }
+        if changed && let Some(idx) = self.selected_input {
+            self.select_input(idx, ctx);
         }
     }
 
@@ -283,6 +359,7 @@ impl CropApp {
         };
         self.selected_input = Some(idx);
         self.status = format!("Loading {}…", folder_label(&dir));
+        let detector = self.detector_for(&dir);
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
 
@@ -290,7 +367,7 @@ impl CropApp {
             // The parallel loader reports progress from worker threads, so the
             // sender goes behind a mutex.
             let progress_tx = Mutex::new(tx.clone());
-            let result = loader::load_input_with_progress(&dir, |done, total| {
+            let result = loader::load_input_with_progress(&dir, detector, |done, total| {
                 if let Ok(tx) = progress_tx.lock() {
                     let _ = tx.send(LoadMsg::Progress { done, total });
                 }
@@ -330,12 +407,23 @@ impl CropApp {
     fn apply_data(&mut self, data: FolderData) {
         let (w, h) = (data.width, data.height);
 
-        // Keep the user's crop when the new folder has the same image size.
-        let same_dims = self.data.as_ref().map(|d| (d.width, d.height)) == Some((w, h));
+        // Keep the user's crop when the new folder has the same image size
+        // and orientation.
+        let same_dims = self
+            .data
+            .as_ref()
+            .map(|d| (d.width, d.height, d.orientation))
+            == Some((w, h, data.orientation));
         if !same_dims {
             self.crop = None;
             self.undo.clear();
         }
+        // The command-line crop is in the on-disk frame: show it on the
+        // oriented frames of this stack.
+        let (disk_w, disk_h) = data.disk_dims();
+        self.initial_crop = self
+            .initial_crop_disk
+            .map(|c| c.from_disk(data.orientation, disk_w, disk_h));
         self.drawing = false;
         self.moving = false;
         self.resizing = None;
@@ -384,8 +472,10 @@ impl CropApp {
         self.apply_active_range();
 
         self.status = format!(
-            "Loaded {} images ({w}×{h} px) from {}{crop_note}",
+            "Loaded {} images ({w}×{h} px, {}: {}) from {}{crop_note}",
             data.n_frames(),
+            data.detector.summary(),
+            data.orientation,
             folder_label(&data.path),
         );
 
@@ -589,11 +679,17 @@ impl CropApp {
             let result = (|| -> Result<String, String> {
                 let mut notes: Vec<String> = Vec::new();
                 if let Some(stack_path) = &stack_dest {
-                    loader::write_cropped_stack(stack_path, &data.frames, crop)
+                    loader::write_cropped_stack(stack_path, &data.frames, crop, data.orientation)
                         .map_err(|e| format!("Failed to write {}: {e:#}", stack_path.display()))?;
                     notes.push(format!("cropped stack → {}", stack_path.display()));
                 }
-                let json = crop.to_json(data.width, data.height, &data.path.display().to_string());
+                let json = crop.to_json(
+                    data.width,
+                    data.height,
+                    &data.path.display().to_string(),
+                    data.detector.detector(),
+                    data.orientation,
+                );
                 if let Some(path) = &json_dest.file {
                     std::fs::write(path, &json)
                         .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
@@ -658,8 +754,29 @@ impl CropApp {
         self.start_save(self.quit_json_dest(), self.output_stack.clone(), true);
     }
 
+    /// The folder the currently displayed input was loaded from, so save
+    /// dialogs open next to the data instead of in the working directory.
+    fn loaded_dir(&self) -> Option<PathBuf> {
+        let path = &self.data.as_ref()?.path;
+        if path.is_dir() {
+            Some(path.clone())
+        } else {
+            path.parent().map(Path::to_path_buf)
+        }
+    }
+
+    /// A file dialog that starts in the loaded input's folder when one is known.
+    fn file_dialog(&self) -> rfd::FileDialog {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(dir) = self.loaded_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+        dialog
+    }
+
     fn save_crop_dialog(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = self
+            .file_dialog()
             .add_filter("JSON", &["json"])
             .set_file_name("crop_region.json")
             .set_title("Save the crop region as JSON")
@@ -678,7 +795,8 @@ impl CropApp {
     }
 
     fn save_stack_dialog(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = self
+            .file_dialog()
             .add_filter("NumPy", &["npy"])
             .set_file_name("cropped_stack.npy")
             .set_title("Save the cropped 3-D stack as .npy (float32)")
@@ -699,7 +817,8 @@ impl CropApp {
     }
 
     fn export_folder_dialog(&mut self) {
-        let Some(dest) = rfd::FileDialog::new()
+        let Some(dest) = self
+            .file_dialog()
             .set_title("Export the cropped images — pick where the new folder is created")
             .pick_folder()
         else {
@@ -709,8 +828,8 @@ impl CropApp {
     }
 
     /// Apply the crop to every image and write them as individual TIFF files
-    /// into a new folder inside `parent`, named after the input and the crop
-    /// bounds (`<input>_crop_x0<x0>_y0<y0>_x1<x1>_y1<y1>`, exclusive stops),
+    /// into a new folder inside `parent`, named after the crop bounds and the
+    /// input (`cropped_x0<x0>_y0<y0>_x1<x1>_y1<y1>_<input>`, exclusive stops),
     /// with the spectra file copied along and a `crop_region.json` sidecar —
     /// on a background thread.
     fn start_export(&mut self, parent: PathBuf) {
@@ -728,12 +847,14 @@ impl CropApp {
         }
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "cropped".to_owned());
+        // Folder name in the on-disk frame, like the crop JSON.
+        let disk = crop.to_disk(data.orientation, data.width, data.height);
         let dest = parent.join(format!(
-            "{stem}_crop_x0{}_y0{}_x1{}_y1{}",
-            crop.x,
-            crop.y,
-            crop.x1(),
-            crop.y1()
+            "cropped_x0{}_y0{}_x1{}_y1{}_{stem}",
+            disk.x,
+            disk.y,
+            disk.x1(),
+            disk.y1()
         ));
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -745,7 +866,13 @@ impl CropApp {
             let result = (|| -> Result<String, String> {
                 let mut notes = loader::export_cropped_images(&dest, &data, crop)
                     .map_err(|e| format!("Export failed: {e:#}"))?;
-                let json = crop.to_json(data.width, data.height, &data.path.display().to_string());
+                let json = crop.to_json(
+                    data.width,
+                    data.height,
+                    &data.path.display().to_string(),
+                    data.detector.detector(),
+                    data.orientation,
+                );
                 let json_path = dest.join("crop_region.json");
                 std::fs::write(&json_path, &json)
                     .map_err(|e| format!("Failed to write {}: {e}", json_path.display()))?;
@@ -875,6 +1002,10 @@ impl CropApp {
                     self.select_input(i, &ctx);
                 }
             }
+
+            ui.separator();
+
+            self.detector_combo(ui, &ctx);
 
             ui.separator();
 
@@ -1087,10 +1218,14 @@ impl CropApp {
                 }
                 ui.separator();
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.label(&self.status);
+                    // Truncated: labels are click-selectable, so a long status
+                    // (e.g. an export path) spilling under the buttons would
+                    // not just look wrong — it would steal their clicks.
+                    ui.add(egui::Label::new(&self.status).truncate())
+                        .on_hover_text(&self.status);
                     if let Some((x, y, v)) = self.cursor {
                         ui.separator();
-                        ui.label(format!("({x}, {y}) = {v:.4}"));
+                        ui.add(egui::Label::new(format!("({x}, {y}) = {v:.4}")).truncate());
                     }
                 });
             });
@@ -1149,6 +1284,26 @@ impl CropApp {
                     human_bytes((n * w * h * 4) as f64),
                     human_bytes((n * crop.area() * 4) as f64),
                 ));
+                if !data.orientation.is_identity() {
+                    let disk = crop.to_disk(data.orientation, w, h);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Saved in the on-disk frame ({}: {}): x={} y={} {}×{}",
+                            data.detector.detector().label(),
+                            data.orientation,
+                            disk.x,
+                            disk.y,
+                            disk.width,
+                            disk.height
+                        ))
+                        .small(),
+                    )
+                    .on_hover_text(
+                        "The image is shown re-oriented for this detector; the crop JSON, the \
+                         cropped stack and the exported images use the coordinates of the files \
+                         as they are on disk.",
+                    );
+                }
             }
         }
         if let Some(init) = self.initial_crop {

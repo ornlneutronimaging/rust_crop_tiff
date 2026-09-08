@@ -8,6 +8,8 @@ name = "crop_tiff"
 path = "src/main.rs"
 
 [dependencies]
+# Detector → orientation on load (Timepix: transpose, CCD: flip vertically).
+detector_orientation = { path = "../rust_detector_orientation" }
 anyhow = "1.0"
 colorgrad = { version = "0.8", features = ["preset"] }
 eframe = "0.35"

@@ -19,7 +19,7 @@ fi
 needs_build=false
 if [[ ! -x "$BINARY" ]]; then
     needs_build=true
-elif [[ -n "$(find "$REPO_DIR/src" "$REPO_DIR/Cargo.toml" -newer "$BINARY" -print -quit 2>/dev/null)" ]]; then
+elif [[ -n "$(find "$REPO_DIR/src" "$REPO_DIR/Cargo.toml" "$REPO_DIR/../rust_detector_orientation/src" -newer "$BINARY" -print -quit 2>/dev/null)" ]]; then
     needs_build=true
 fi
 

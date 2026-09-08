@@ -42,9 +42,21 @@ OPTIONS:
                             the caller can re-apply the same crop to another
                             data set.
   -c, --crop <X,Y,W,H>      Initial crop region (e.g. a previous crop) shown
-                            on the image at startup, e.g. 100,200,512,512
+                            on the image at startup, e.g. 100,200,512,512 —
+                            in the on-disk frame of the files, like the
+                            saved JSON
   --crop-file <PATH>        Read the initial crop region from a JSON file
                             written by a previous session
+  --detector <NAME>         Force the detector the inputs are loaded as,
+                            which decides how the frames are shown: timepix
+                            (transposed), ccd (flipped vertically), qhy
+                            (as-is, not decided yet) or as-is. By default the
+                            detector is recognized from the folder layout
+                            (images/tpx1, images/ikonxl, …); the toolbar has
+                            a combobox to change it. The crop is drawn on
+                            the oriented image, but the saved crop JSON, the
+                            cropped stack and the exported images are always
+                            in the on-disk frame of the input files
   --called-from-app         The app is driven by another application that is
                             blocked waiting for the crop: the save button
                             reads '↩ Return to main application', which
@@ -67,6 +79,7 @@ struct Args {
     initial_crop: Option<CropRect>,
     called_from_app: bool,
     instructions: Option<String>,
+    detector: Option<rust_crop_tiff::loader::Detector>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -76,6 +89,7 @@ fn parse_args() -> Result<Args, String> {
     let mut initial_crop: Option<CropRect> = None;
     let mut called_from_app = false;
     let mut instructions = None;
+    let mut detector = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -129,6 +143,12 @@ fn parse_args() -> Result<Args, String> {
                 let text = args.next().ok_or("--instructions requires a text argument")?;
                 instructions = Some(text);
             }
+            "--detector" => {
+                let v = args.next().ok_or("--detector requires timepix, ccd, qhy or as-is")?;
+                detector = Some(rust_crop_tiff::loader::Detector::parse(&v).ok_or_else(|| {
+                    format!("invalid --detector '{v}': expected timepix, ccd, qhy or as-is")
+                })?);
+            }
             s if s.starts_with('-') => return Err(format!("Unknown option: {s}")),
             _ => inputs.push(PathBuf::from(a)),
         }
@@ -153,6 +173,7 @@ fn parse_args() -> Result<Args, String> {
         initial_crop,
         called_from_app,
         instructions,
+        detector,
     })
 }
 
@@ -188,6 +209,7 @@ fn main() -> eframe::Result<()> {
                 args.called_from_app,
                 args.instructions,
             );
+            app.set_detector_override(args.detector);
             app.select_first(&cc.egui_ctx);
             Ok(Box::new(app))
         }),

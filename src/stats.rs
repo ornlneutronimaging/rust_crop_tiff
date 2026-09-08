@@ -49,28 +49,27 @@ impl CropStats {
     }
 }
 
-/// Compute the per-frame crop statistics. `frame_totals[i]` must be the total
-/// counts of `frames[i]` (precomputed at load time).
+/// Compute the per-frame crop statistics. `frame_totals[i]` must be the sum
+/// and count of the finite pixels of `frames[i]` (precomputed at load time).
+///
+/// Non-finite pixels (NaN/inf, common in normalized data) are excluded from
+/// every sum and every mean divides by the count of finite pixels, so a few
+/// bad pixels cannot turn the whole curve NaN (which would blank the plot).
+/// A region with no finite pixel yields NaN and is skipped by the plot.
 pub fn compute(
     frames: &[Array2<f32>],
-    frame_totals: &[f64],
+    frame_totals: &[(f64, usize)],
     crop: CropRect,
     band: usize,
 ) -> CropStats {
-    let (inside_area, outside_area) = match frames.first() {
-        Some(f) => {
-            let total_px = f.len();
-            (crop.area(), total_px - crop.area())
-        }
-        None => {
-            return CropStats {
-                band,
-                edge_mean: Vec::new(),
-                inside_mean: Vec::new(),
-                outside_mean: Vec::new(),
-            }
-        }
-    };
+    if frames.is_empty() {
+        return CropStats {
+            band,
+            edge_mean: Vec::new(),
+            inside_mean: Vec::new(),
+            outside_mean: Vec::new(),
+        };
+    }
 
     // Region strictly inside the edge band; empty when the crop is too small
     // for the band, in which case the whole crop is the band.
@@ -81,29 +80,32 @@ pub fn compute(
         height: crop.height - 2 * band,
     });
 
+    let mean = |sum: f64, n: usize| if n > 0 { sum / n as f64 } else { f64::NAN };
     let per_frame: Vec<(f64, f64, f64)> = frames
         .par_iter()
         .zip(frame_totals)
-        .map(|(f, &total)| {
-            let sum_of = |r: CropRect| -> f64 {
-                f.slice(s![r.y..r.y1(), r.x..r.x1()])
-                    .iter()
-                    .map(|&v| v as f64)
-                    .sum()
+        .map(|(f, &(total_sum, total_n))| {
+            // Sum and count of the finite pixels of a region.
+            let sum_of = |r: CropRect| -> (f64, usize) {
+                let (mut sum, mut n) = (0.0f64, 0usize);
+                for &v in f.slice(s![r.y..r.y1(), r.x..r.x1()]).iter() {
+                    if v.is_finite() {
+                        sum += v as f64;
+                        n += 1;
+                    }
+                }
+                (sum, n)
             };
-            let inside_sum = sum_of(crop);
-            let (edge_sum, edge_area) = match inner {
-                Some(inner) => (inside_sum - sum_of(inner), inside_area - inner.area()),
-                None => (inside_sum, inside_area),
+            let (inside_sum, inside_n) = sum_of(crop);
+            let (edge_sum, edge_n) = match inner {
+                Some(inner) => {
+                    let (inner_sum, inner_n) = sum_of(inner);
+                    (inside_sum - inner_sum, inside_n - inner_n)
+                }
+                None => (inside_sum, inside_n),
             };
-            let inside_mean = inside_sum / inside_area as f64;
-            let edge_mean = edge_sum / edge_area as f64;
-            let outside_mean = if outside_area > 0 {
-                (total - inside_sum) / outside_area as f64
-            } else {
-                f64::NAN
-            };
-            (edge_mean, inside_mean, outside_mean)
+            let outside_mean = mean(total_sum - inside_sum, total_n - inside_n);
+            (mean(edge_sum, edge_n), mean(inside_sum, inside_n), outside_mean)
         })
         .collect();
 
@@ -127,10 +129,14 @@ mod tests {
         f
     }
 
-    fn totals(frames: &[Array2<f32>]) -> Vec<f64> {
+    fn totals(frames: &[Array2<f32>]) -> Vec<(f64, usize)> {
         frames
             .iter()
-            .map(|f| f.iter().map(|&v| v as f64).sum())
+            .map(|f| {
+                let finite: Vec<f64> =
+                    f.iter().filter(|v| v.is_finite()).map(|&v| v as f64).collect();
+                (finite.iter().sum(), finite.len())
+            })
             .collect()
     }
 
@@ -168,6 +174,26 @@ mod tests {
         // Band area: 36 - 16 = 20 px; one of them is +100.
         assert!((s.edge_mean[1] - (1.0 + 100.0 / 20.0)).abs() < 1e-9);
         assert_eq!(s.most_suspicious_frame(), Some(1));
+    }
+
+    #[test]
+    fn non_finite_pixels_are_ignored() {
+        // A NaN inside the crop and an inf outside must not turn the means
+        // NaN (that blanked the right-hand plot on normalized data).
+        let mut f = frame_with(10, 10, 2.0, None);
+        f[(5, 5)] = f32::NAN;
+        f[(0, 0)] = f32::INFINITY;
+        let frames = vec![f];
+        let crop = CropRect {
+            x: 2,
+            y: 2,
+            width: 6,
+            height: 6,
+        };
+        let s = compute(&frames, &totals(&frames), crop, 1);
+        assert_eq!(s.inside_mean, vec![2.0]);
+        assert_eq!(s.outside_mean, vec![2.0]);
+        assert_eq!(s.edge_mean, vec![2.0]);
     }
 
     #[test]

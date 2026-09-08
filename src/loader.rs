@@ -3,12 +3,18 @@
 //! another application such as rust_ct_reconstruction hands its stack over).
 //!
 //! Every frame is normalised to an `Array2<f32>` with shape `(height, width)`,
-//! row-major. Besides the frames themselves, the loader computes the pixel-wise
+//! row-major, in the *sample* orientation of the detector that wrote it
+//! ([`detector_orientation`]: Timepix TIFFs are transposed, CCD TIFFs flipped
+//! vertically; `.npy` stacks are already-processed data and stay as they
+//! are). The crop is drawn on these oriented frames; everything written back
+//! to disk ([`write_cropped_stack`], [`export_cropped_images`]) is put back in
+//! the on-disk frame of the input files. Besides the frames themselves, the loader computes the pixel-wise
 //! projections used to judge a crop against the whole stack: sum, mean, max,
 //! min and standard deviation, plus the total counts of each frame.
 
 use crate::crop::CropRect;
 use anyhow::{anyhow, bail, Context, Result};
+pub use detector_orientation::{Detector, Orientation, Selection, Source};
 use ndarray::{s, Array2, Array3};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -17,8 +23,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Everything the application needs about one input (folder or `.npy` stack).
 pub struct FolderData {
     pub path: PathBuf,
-    /// One frame per TIFF page, in sorted file order.
+    /// Detector the stack was recorded with (automatic guess + user
+    /// override), which decides [`FolderData::orientation`].
+    pub detector: Selection,
+    /// How every frame was re-oriented on load relative to the file on disk
+    /// (always [`Orientation::Identity`] for a `.npy` input).
+    pub orientation: Orientation,
+    /// One frame per TIFF page, in sorted file order, already oriented.
     pub frames: Vec<Array2<f32>>,
+    /// Size of the oriented frames.
     pub width: usize,
     pub height: usize,
     /// Pixel-wise sum of every frame (the "integrated" image).
@@ -33,13 +46,20 @@ pub struct FolderData {
     /// Pixel-wise standard deviation across the frames: moving edges and
     /// changing regions stand out.
     pub std: Array2<f32>,
-    /// Total counts of each frame, used by the crop statistics.
-    pub frame_totals: Vec<f64>,
+    /// Per frame: sum of the finite pixels and their count, used by the
+    /// crop statistics. Non-finite pixels (NaN/inf, common in normalized
+    /// data) are excluded so the statistics stay finite.
+    pub frame_totals: Vec<(f64, usize)>,
 }
 
 impl FolderData {
     pub fn n_frames(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Size of the frames as they are on disk.
+    pub fn disk_dims(&self) -> (usize, usize) {
+        self.orientation.dims(self.width, self.height)
     }
 }
 
@@ -115,27 +135,38 @@ pub fn is_supported_input(path: &Path) -> bool {
 }
 
 /// Load one input — a folder of TIFF images or a `.npy` stack file — and
-/// compute the projections. `on_progress(files_done, files_total)` is called
-/// from worker threads as files finish, so a caller can drive a progress bar.
-pub fn load_input_with_progress<F>(path: &Path, on_progress: F) -> Result<FolderData>
+/// compute the projections. `detector` decides how TIFF frames are oriented
+/// (a `.npy` stack is loaded as-is). `on_progress(files_done, files_total)`
+/// is called from worker threads as files finish, so a caller can drive a
+/// progress bar.
+pub fn load_input_with_progress<F>(
+    path: &Path,
+    detector: Selection,
+    on_progress: F,
+) -> Result<FolderData>
 where
     F: Fn(usize, usize) + Sync,
 {
     if path.is_dir() {
-        return load_folder_with_progress(path, on_progress);
+        return load_folder_with_progress(path, detector, on_progress);
     }
     let frames = load_npy(path)?;
     on_progress(1, 1);
-    build_folder_data(path, frames)
+    build_folder_data(path, frames, detector, Orientation::Identity)
 }
 
 /// Load every TIFF of `dir` (in parallel) and compute the projections.
 /// `on_progress(files_done, files_total)` is called from worker threads as
 /// files finish, so a caller can drive a progress bar.
-pub fn load_folder_with_progress<F>(dir: &Path, on_progress: F) -> Result<FolderData>
+pub fn load_folder_with_progress<F>(
+    dir: &Path,
+    detector: Selection,
+    on_progress: F,
+) -> Result<FolderData>
 where
     F: Fn(usize, usize) + Sync,
 {
+    let orientation = detector.orientation();
     let paths = list_tiff_in_dir(dir)?;
     let total = paths.len();
     let done = AtomicUsize::new(0);
@@ -144,7 +175,7 @@ where
     let per_file: Vec<Result<Vec<Array2<f32>>>> = paths
         .par_iter()
         .map(|p| {
-            let r = load_tiff(p);
+            let r = load_tiff(p, orientation);
             on_progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
             r
         })
@@ -166,12 +197,17 @@ where
             frames.push(frame);
         }
     }
-    build_folder_data(dir, frames)
+    build_folder_data(dir, frames, detector, orientation)
 }
 
 /// Compute the projections and per-frame totals of `frames` (all of the same
-/// size) and assemble the [`FolderData`].
-fn build_folder_data(path: &Path, frames: Vec<Array2<f32>>) -> Result<FolderData> {
+/// size, already oriented) and assemble the [`FolderData`].
+fn build_folder_data(
+    path: &Path,
+    frames: Vec<Array2<f32>>,
+    detector: Selection,
+    orientation: Orientation,
+) -> Result<FolderData> {
     let (height, width) = match frames.first() {
         Some(f) => (f.shape()[0], f.shape()[1]),
         None => return Err(anyhow!("No frames were loaded")),
@@ -201,13 +237,24 @@ fn build_folder_data(path: &Path, frames: Vec<Array2<f32>>) -> Result<FolderData
         std[i] = (acc.sumsq[i] / n - m * m).max(0.0).sqrt() as f32;
     }
 
-    let frame_totals: Vec<f64> = frames
+    let frame_totals: Vec<(f64, usize)> = frames
         .par_iter()
-        .map(|f| f.iter().map(|&v| v as f64).sum())
+        .map(|f| {
+            let (mut sum, mut n) = (0.0f64, 0usize);
+            for &v in f.iter() {
+                if v.is_finite() {
+                    sum += v as f64;
+                    n += 1;
+                }
+            }
+            (sum, n)
+        })
         .collect();
 
     Ok(FolderData {
         path: path.to_path_buf(),
+        detector,
+        orientation,
         frames,
         width,
         height,
@@ -271,27 +318,47 @@ fn load_npy(path: &Path) -> Result<Vec<Array2<f32>>> {
     )
 }
 
+/// One frame cropped to `crop` (drawn on the oriented frame) and put back in
+/// the on-disk frame: the same pixels as slicing the file on disk with the
+/// crop's [`CropRect::to_disk`] counterpart.
+fn crop_to_disk(frame: &Array2<f32>, crop: CropRect, orientation: Orientation) -> Array2<f32> {
+    orientation.undo_view(frame.slice(s![crop.y..crop.y1(), crop.x..crop.x1()]))
+}
+
 /// The cropped stack as one contiguous `float32` array of shape
-/// `(n_frames, crop.height, crop.width)` — what `--output-stack` returns to
-/// the calling application.
-pub fn cropped_stack(frames: &[Array2<f32>], crop: CropRect) -> Array3<f32> {
-    let mut out = Array3::<f32>::zeros((frames.len(), crop.height, crop.width));
+/// `(n_frames, disk_height, disk_width)` — the crop in the on-disk frame of
+/// the input files, what `--output-stack` returns to the calling
+/// application. `orientation` is how `frames` were oriented on load.
+pub fn cropped_stack(
+    frames: &[Array2<f32>],
+    crop: CropRect,
+    orientation: Orientation,
+) -> Array3<f32> {
+    let (dw, dh) = orientation.dims(crop.width, crop.height);
+    let mut out = Array3::<f32>::zeros((frames.len(), dh, dw));
     for (i, f) in frames.iter().enumerate() {
         out.slice_mut(s![i, .., ..])
-            .assign(&f.slice(s![crop.y..crop.y1(), crop.x..crop.x1()]));
+            .assign(&crop_to_disk(f, crop, orientation));
     }
     out
 }
 
-/// Write the cropped stack to `path` as a NumPy `.npy` file.
-pub fn write_cropped_stack(path: &Path, frames: &[Array2<f32>], crop: CropRect) -> Result<()> {
-    let stack = cropped_stack(frames, crop);
+/// Write the cropped stack to `path` as a NumPy `.npy` file (on-disk frame,
+/// see [`cropped_stack`]).
+pub fn write_cropped_stack(
+    path: &Path,
+    frames: &[Array2<f32>],
+    crop: CropRect,
+    orientation: Orientation,
+) -> Result<()> {
+    let stack = cropped_stack(frames, crop, orientation);
     ndarray_npy::write_npy(path, &stack)
         .with_context(|| format!("write cropped stack {}", path.display()))
 }
 
-/// Apply `crop` to every frame and write them as individual float32 TIFF
-/// files into `dest` (created if needed). When the input was a folder whose
+/// Apply `crop` (drawn on the oriented frames) to every frame and write them
+/// as individual float32 TIFF files into `dest` (created if needed), in the
+/// on-disk frame of the input files. When the input was a folder whose
 /// TIFF files map 1:1 onto the frames, the original file names are kept so
 /// downstream tools and the spectra file still line up; otherwise the frames
 /// are numbered after the input's stem. Any `*_Spectra.txt` file next to the
@@ -331,26 +398,27 @@ pub fn export_cropped_images(dest: &Path, data: &FolderData, crop: CropRect) -> 
         .zip(names.par_iter())
         .try_for_each(|(frame, name)| -> Result<()> {
             let path = dest.join(name);
-            let cropped = frame.slice(s![crop.y..crop.y1(), crop.x..crop.x1()]);
+            let cropped = crop_to_disk(frame, crop, data.orientation);
+            let (dh, dw) = (cropped.nrows(), cropped.ncols());
             let values: Vec<f32> = cropped.iter().copied().collect();
             let file = std::fs::File::create(&path)
                 .with_context(|| format!("create {}", path.display()))?;
             let mut enc = tiff::encoder::TiffEncoder::new(std::io::BufWriter::new(file))
                 .with_context(|| format!("encode TIFF {}", path.display()))?;
             enc.write_image::<tiff::encoder::colortype::Gray32Float>(
-                crop.width as u32,
-                crop.height as u32,
+                dw as u32,
+                dh as u32,
                 &values,
             )
             .with_context(|| format!("write {}", path.display()))?;
             Ok(())
         })?;
 
+    let (dw, dh) = data.orientation.dims(crop.width, crop.height);
     let mut notes = vec![format!(
-        "{} cropped images ({}×{} px) → {}",
+        "{} cropped images ({dw}×{dh} px on disk, {}) → {}",
         data.frames.len(),
-        crop.width,
-        crop.height,
+        data.orientation,
         dest.display()
     )];
 
@@ -380,8 +448,8 @@ pub fn export_cropped_images(dest: &Path, data: &FolderData, crop: CropRect) -> 
     Ok(notes)
 }
 
-/// Read every page of a (possibly multi-page) TIFF file.
-fn load_tiff(path: &Path) -> Result<Vec<Array2<f32>>> {
+/// Read every page of a (possibly multi-page) TIFF file, oriented.
+fn load_tiff(path: &Path, orientation: Orientation) -> Result<Vec<Array2<f32>>> {
     use tiff::decoder::{Decoder, DecodingResult};
 
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -408,7 +476,7 @@ fn load_tiff(path: &Path) -> Result<Vec<Array2<f32>>> {
             DecodingResult::F64(v) => v.into_iter().map(|x| x as f32).collect(),
         };
 
-        out.push(to_frame(values, w, h)?);
+        out.push(orientation.apply(to_frame(values, w, h)?));
 
         if !decoder.more_images() {
             break;
@@ -460,8 +528,9 @@ mod tests {
         write_tiff_u16(&dir.join("img_00001.tif"), 4, 3, 7);
         write_tiff_u16(&dir.join("img_00000.tif"), 4, 3, 5);
 
-        let data = load_folder_with_progress(&dir, |_, _| {}).unwrap();
+        let data = load_folder_with_progress(&dir, Selection::default(), |_, _| {}).unwrap();
         assert_eq!(data.n_frames(), 2);
+        assert_eq!(data.orientation, Orientation::Identity);
         assert_eq!((data.width, data.height), (4, 3));
         // Sorted order: img_00000 (5) first.
         assert_eq!(data.frames[0][(0, 0)], 5.0);
@@ -470,13 +539,13 @@ mod tests {
         assert_eq!(data.max[(1, 1)], 7.0);
         assert_eq!(data.min[(1, 1)], 5.0);
         assert!((data.std[(0, 0)] - 1.0).abs() < 1e-6, "std of {{5,7}} is 1");
-        assert_eq!(data.frame_totals, vec![60.0, 84.0]);
+        assert_eq!(data.frame_totals, vec![(60.0, 12), (84.0, 12)]);
     }
 
     #[test]
     fn folder_without_tiff_fails() {
         let dir = tmp_dir("empty");
-        assert!(load_folder_with_progress(&dir, |_, _| {}).is_err());
+        assert!(load_folder_with_progress(&dir, Selection::default(), |_, _| {}).is_err());
     }
 
     #[test]
@@ -490,8 +559,11 @@ mod tests {
         ndarray_npy::write_npy(&path, &a).unwrap();
 
         assert!(is_supported_input(&path));
-        let data = load_input_with_progress(&path, |_, _| {}).unwrap();
+        // a .npy stack is never re-oriented, whatever the detector says
+        let timepix = Selection { manual: Some(Detector::Timepix), ..Default::default() };
+        let data = load_input_with_progress(&path, timepix, |_, _| {}).unwrap();
         assert_eq!(data.n_frames(), 2);
+        assert_eq!(data.orientation, Orientation::Identity);
         assert_eq!((data.width, data.height), (4, 3));
         assert_eq!(data.frames[1][(2, 3)], 123.0);
         assert_eq!(data.sum[(0, 1)], 1.0 + 101.0);
@@ -504,7 +576,7 @@ mod tests {
         write_tiff_u16(&dir.join("img_00001.tif"), 6, 5, 7);
         std::fs::write(dir.join("run_Spectra.txt"), "tof,counts\n").unwrap();
 
-        let data = load_folder_with_progress(&dir, |_, _| {}).unwrap();
+        let data = load_folder_with_progress(&dir, Selection::default(), |_, _| {}).unwrap();
         let crop = CropRect {
             x: 1,
             y: 2,
@@ -518,7 +590,7 @@ mod tests {
 
         // Original names kept, spectra copied.
         assert!(dest.join("run_Spectra.txt").is_file());
-        let frames = load_tiff(&dest.join("img_00001.tif")).unwrap();
+        let frames = load_tiff(&dest.join("img_00001.tif"), Orientation::Identity).unwrap();
         assert_eq!(frames[0].shape(), &[2, 3]);
         assert_eq!(frames[0][(0, 0)], 7.0);
 
@@ -541,7 +613,7 @@ mod tests {
             width: 3,
             height: 2,
         };
-        write_cropped_stack(&path, &frames, crop).unwrap();
+        write_cropped_stack(&path, &frames, crop, Orientation::Identity).unwrap();
 
         let file = std::fs::File::open(&path).unwrap();
         let back = Array3::<f32>::read_npy(file).unwrap();
@@ -549,5 +621,68 @@ mod tests {
         // frame 1, crop-local (0, 0) is full-image (y=2, x=1).
         assert_eq!(back[(1, 0, 0)], 121.0);
         assert_eq!(back[(0, 1, 2)], 33.0);
+    }
+
+    /// A distinct-valued 6 wide × 5 tall TIFF: value = 10*y + x.
+    fn write_tiff_pattern(path: &Path) {
+        use tiff::encoder::{colortype, TiffEncoder};
+        let file = std::fs::File::create(path).unwrap();
+        let mut enc = TiffEncoder::new(std::io::BufWriter::new(file)).unwrap();
+        let data: Vec<u16> = (0..5).flat_map(|y| (0..6).map(move |x| (10 * y + x) as u16)).collect();
+        enc.write_image::<colortype::Gray16>(6, 5, &data).unwrap();
+    }
+
+    /// Cropping an oriented stack (Timepix transpose, CCD flip) writes exactly
+    /// the pixels that slicing the on-disk file with the crop's on-disk
+    /// counterpart gives — for both the `.npy` stack and the TIFF export.
+    #[test]
+    fn oriented_crops_write_disk_pixels() {
+        let src = tmp_dir("oriented_src");
+        write_tiff_pattern(&src.join("img_00000.tif"));
+        let disk = load_folder_with_progress(&src, Selection::default(), |_, _| {}).unwrap();
+        assert_eq!((disk.width, disk.height), (6, 5));
+
+        for det in [Detector::Timepix, Detector::Ccd, Detector::Qhy] {
+            let sel = Selection { manual: Some(det), ..Default::default() };
+            let data = load_folder_with_progress(&src, sel, |_, _| {}).unwrap();
+            let o = data.orientation;
+            assert_eq!(o, det.orientation());
+            assert_eq!(data.disk_dims(), (6, 5));
+            // a crop drawn on the oriented image
+            let crop = CropRect { x: 1, y: 2, width: 2, height: 3 }
+                .clamp_to(data.width, data.height)
+                .unwrap();
+            let disk_crop = crop.to_disk(o, data.width, data.height);
+            assert_eq!(disk_crop.from_disk(o, 6, 5), crop, "{det:?} round trip");
+            let expected: Vec<f32> = (disk_crop.y..disk_crop.y1())
+                .flat_map(|y| (disk_crop.x..disk_crop.x1()).map(move |x| (10 * y + x) as f32))
+                .collect();
+
+            let stack = cropped_stack(&data.frames, crop, o);
+            assert_eq!(stack.shape(), &[1, disk_crop.height, disk_crop.width], "{det:?}");
+            assert_eq!(stack.iter().copied().collect::<Vec<_>>(), expected, "{det:?} stack");
+
+            let dest = tmp_dir(&format!("oriented_dst_{det:?}"));
+            export_cropped_images(&dest, &data, crop).unwrap();
+            let frames = load_tiff(&dest.join("img_00000.tif"), Orientation::Identity).unwrap();
+            assert_eq!(frames[0].shape(), &[disk_crop.height, disk_crop.width], "{det:?}");
+            assert_eq!(frames[0].iter().copied().collect::<Vec<_>>(), expected, "{det:?} tiff");
+        }
+    }
+
+    #[test]
+    fn crop_json_is_in_disk_frame() {
+        // 6 wide × 5 tall on disk; transposed it is 5 wide × 6 tall.
+        let crop = CropRect { x: 1, y: 2, width: 2, height: 3 };
+        let json = crop.to_json(5, 6, "/data/images/tpx1/run", Detector::Timepix, Orientation::Transpose);
+        let back = CropRect::from_json_text(&json).unwrap();
+        assert_eq!(back, CropRect { x: 2, y: 1, width: 3, height: 2 });
+        assert!(json.contains("\"image_width\": 6"));
+        assert!(json.contains("\"image_height\": 5"));
+        assert!(json.contains("\"detector\": \"Timepix\""));
+        assert!(json.contains("\"display_x\": 1"));
+        // identity: unchanged
+        let json = crop.to_json(6, 5, "x", Detector::Unknown, Orientation::Identity);
+        assert_eq!(CropRect::from_json_text(&json).unwrap(), crop);
     }
 }
