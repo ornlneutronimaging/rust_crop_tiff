@@ -159,6 +159,15 @@ pub struct CropApp {
     img_dirty: bool,
     scale: f32,
     fit_requested: bool,
+    /// True while the image is shown at the fit-to-view scale (after a load or
+    /// the Fit button), so it follows the viewport when the divider or the
+    /// window is resized. A manual zoom (− / +) clears it.
+    fitted: bool,
+    /// The viewport size the fitted scale was computed for.
+    fitted_viewport: egui::Vec2,
+    /// Scroll offset to apply to the image viewport on the next frame, set by
+    /// a Ctrl+wheel zoom so the image point under the cursor stays put.
+    viewer_scroll: Option<egui::Vec2>,
     cursor: Option<(usize, usize, f32)>,
     playing: bool,
     last_advance: Option<Instant>,
@@ -240,6 +249,9 @@ impl CropApp {
             img_dirty: false,
             scale: 1.0,
             fit_requested: false,
+            fitted: false,
+            fitted_viewport: egui::Vec2::ZERO,
+            viewer_scroll: None,
             cursor: None,
             playing: false,
             last_advance: None,
@@ -1127,12 +1139,15 @@ impl CropApp {
                 .on_hover_text("Darken everything the crop throws away");
 
             ui.separator();
-            ui.label("Zoom:");
+            ui.label("Zoom:")
+                .on_hover_text("Ctrl + mouse wheel over the image zooms around the cursor");
             if ui.button("−").clicked() {
                 self.scale = (self.scale / 1.25).max(0.02);
+                self.fitted = false;
             }
             if ui.button("+").clicked() {
                 self.scale = (self.scale * 1.25).min(64.0);
+                self.fitted = false;
             }
             if ui.button("Fit").clicked() {
                 self.fit_requested = true;
@@ -1499,29 +1514,70 @@ impl CropApp {
             0.0
         };
 
+        // The viewport the image has to fit in: the panel minus the slider.
+        // Dragging the divider (or resizing the window) changes it; while the
+        // image is in the fitted state it follows, so the left side never
+        // keeps a stale scale after the panel grows or shrinks.
+        let viewport = egui::vec2(ui.available_width(), (panel_h - slider_height).max(1.0));
+        if self.fitted && viewport != self.fitted_viewport {
+            self.fit_requested = true;
+        }
         if self.fit_requested && w > 0 && h > 0 {
-            let avail = ui.available_size();
-            let s = (avail.x / w as f32)
-                .min((panel_h - slider_height).max(1.0) / h as f32);
+            let s = (viewport.x / w as f32).min(viewport.y / h as f32);
             self.scale = s.clamp(0.02, 64.0);
             self.fit_requested = false;
+            self.fitted = true;
+            self.fitted_viewport = viewport;
         }
 
-        egui::ScrollArea::both()
+        let mut scroll = egui::ScrollArea::both()
             .max_height((panel_h - slider_height).max(120.0))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let size = egui::vec2(w as f32 * self.scale, h as f32 * self.scale);
-                let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+            .auto_shrink([false, false]);
+        if let Some(offset) = self.viewer_scroll.take() {
+            scroll = scroll.scroll_offset(offset);
+        }
+        // A Ctrl+wheel zoom over the image: (image x, image y under the
+        // cursor, zoom factor). Applied after the scroll area reports its
+        // current offset, so the next frame's scale and offset match.
+        let mut wheel_zoom: Option<(f32, f32, f32)> = None;
+        let out = scroll.show(ui, |ui| {
+            let size = egui::vec2(w as f32 * self.scale, h as f32 * self.scale);
+            let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
 
-                let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-                let painter = ui.painter_at(rect);
-                if let Some(t) = &self.img_tex {
-                    painter.image(t.id(), rect, full_uv, Color32::WHITE);
+            let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            let painter = ui.painter_at(rect);
+            if let Some(t) = &self.img_tex {
+                painter.image(t.id(), rect, full_uv, Color32::WHITE);
+            }
+
+            self.handle_interaction(&painter, rect, &response, w, h, &data);
+
+            // egui turns Ctrl (Cmd on macOS) + wheel into a zoom factor
+            // instead of a scroll; the pinch gesture arrives the same way.
+            if response.contains_pointer() {
+                let factor = ui.input(|i| i.zoom_delta());
+                if factor != 1.0
+                    && let Some(p) = response.hover_pos()
+                {
+                    let ix = (p.x - rect.left()) / self.scale;
+                    let iy = (p.y - rect.top()) / self.scale;
+                    wheel_zoom = Some((ix, iy, factor));
                 }
-
-                self.handle_interaction(&painter, rect, &response, w, h, &data);
-            });
+            }
+        });
+        if let Some((ix, iy, factor)) = wheel_zoom {
+            let old = self.scale;
+            let new = (old * factor).clamp(0.02, 64.0);
+            if new != old {
+                // Keep the image point (ix, iy) under the cursor: the content
+                // shifts by its distance to the origin times the scale change.
+                let offset = out.state.offset + egui::vec2(ix, iy) * (new - old);
+                self.viewer_scroll = Some(offset.max(egui::Vec2::ZERO));
+                self.scale = new;
+                self.fitted = false;
+                ui.ctx().request_repaint();
+            }
+        }
 
         if show_slider {
             ui.horizontal(|ui| {
