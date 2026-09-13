@@ -197,6 +197,7 @@ fn main() -> eframe::Result<()> {
         "VENUS Crop TIFF",
         native_options,
         Box::new(move |cc| {
+            install_fonts(&cc.egui_ctx);
             // Saved light/dark preference, shared by all the VENUS rust
             // tools (dark when none is saved); the toolbar has a toggle.
             cc.egui_ctx.set_theme(rust_crop_tiff::theme::load());
@@ -214,4 +215,18 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+/// egui's proportional family (Ubuntu-Light + the emoji fonts) has no glyph
+/// for the arrows (→ ← ↑ ↓), bullets and similar symbols used in the labels,
+/// which then show up as squares; the bundled monospace font Hack has them,
+/// so it is appended as the last fallback of the proportional family.
+fn install_fonts(ctx: &eframe::egui::Context) {
+    let mut fonts = eframe::egui::FontDefinitions::default();
+    if let Some(family) = fonts.families.get_mut(&eframe::egui::FontFamily::Proportional) {
+        if !family.iter().any(|f| f == "Hack") {
+            family.push("Hack".to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
 }
