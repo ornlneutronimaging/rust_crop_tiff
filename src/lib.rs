@@ -6,6 +6,7 @@
 //! exposed here so they can be unit tested without a display.
 
 pub mod app;
+pub mod batch;
 pub mod colormap;
 pub mod crop;
 pub mod loader;

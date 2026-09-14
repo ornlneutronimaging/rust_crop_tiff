@@ -74,6 +74,46 @@ crop_tiff stack.npy --called-from-app \
   `<input>_crop_x0<x0>_y0<y0>_x1<x1>_y1<y1>` (exclusive stops). The input
   folder's `*_Spectra.txt` file is copied along and a `crop_region.json` is
   dropped in the folder.
+- **🗄 Batch crop…** applies the same crop to **many other folders** at once
+  in a separate window — see [Batch crop](#batch-crop) below.
+
+## Batch crop
+
+Once the crop is right on one stack, **🗄 Batch crop…** (bottom bar) opens a
+second window to apply it to a whole set of folders:
+
+1. **Folders to crop** — *📁 Add folders…* picks any number of folders
+   (multi-select in the dialog). These are typically *sample* folders whose
+   images sit further down, e.g. `<sample>/<Run_NNNN>/…`.
+2. **Data sub-folder** — the tree of the *first* folder is shown (each entry
+   with its TIFF count); click the folder holding the images, type the
+   relative path, or let *🔍 Auto* walk down while the folder holds no TIFF
+   and has a single sub-folder. The same relative path is resolved in every
+   other folder **level by level: the sub-folder with the same name when it
+   exists, otherwise the only sub-folder at that level** — so run folders
+   whose names differ from sample to sample still resolve. The table lists
+   the data folder found for every input, its TIFF count, and why one could
+   not be resolved (missing, ambiguous, no TIFF).
+3. **Output folder** — every input is written under it as
+   `cropped_x0<x0>_y0<y0>_x1<x1>_y1<y1>_<folder name>/<data sub-folder>`,
+   i.e. the same naming as the single export and the same sub-structure as
+   the input, with the original file names, the `*_Spectra.txt` file copied
+   along and a `crop_region.json` in each data folder.
+4. **👁 Preview crops** (optional) shows a thumbnail of every folder (the
+   mean of a few evenly spaced images) with the crop drawn on it and the
+   outside dimmed; click one to enlarge it. A ⚠ marks folders whose image
+   size differs from the reference stack (the crop is still applied when it
+   fits) or where the crop does not fit (that folder will fail).
+5. **▶ Crop all folders** runs the export folder by folder on a background
+   thread; the table shows a per-folder progress bar, then ✅ with the output
+   path or ❌ with the reason. *⏹ Cancel* stops after the current files. The
+   main window stays usable, and the job keeps running if the batch window
+   is closed.
+
+The frames of every folder are oriented by the detector recognized from its
+path (or the toolbar's *Detector* override), like in the main window, and
+the crop is applied as drawn on those oriented frames; every file written is
+in the on-disk frame of its input, like the single export.
 
 ## Output format
 

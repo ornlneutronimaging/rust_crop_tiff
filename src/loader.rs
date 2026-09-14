@@ -321,7 +321,7 @@ fn load_npy(path: &Path) -> Result<Vec<Array2<f32>>> {
 /// One frame cropped to `crop` (drawn on the oriented frame) and put back in
 /// the on-disk frame: the same pixels as slicing the file on disk with the
 /// crop's [`CropRect::to_disk`] counterpart.
-fn crop_to_disk(frame: &Array2<f32>, crop: CropRect, orientation: Orientation) -> Array2<f32> {
+pub(crate) fn crop_to_disk(frame: &Array2<f32>, crop: CropRect, orientation: Orientation) -> Array2<f32> {
     orientation.undo_view(frame.slice(s![crop.y..crop.y1(), crop.x..crop.x1()]))
 }
 
@@ -449,7 +449,7 @@ pub fn export_cropped_images(dest: &Path, data: &FolderData, crop: CropRect) -> 
 }
 
 /// Read every page of a (possibly multi-page) TIFF file, oriented.
-fn load_tiff(path: &Path, orientation: Orientation) -> Result<Vec<Array2<f32>>> {
+pub(crate) fn load_tiff(path: &Path, orientation: Orientation) -> Result<Vec<Array2<f32>>> {
     use tiff::decoder::{Decoder, DecodingResult};
 
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;

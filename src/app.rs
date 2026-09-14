@@ -4,6 +4,7 @@
 //! on the image, and a verification panel plotting per-frame crop statistics
 //! so no image of the stack loses important content.
 
+use crate::batch::{self, BatchRef, BatchWindow};
 use crate::colormap::Colormap;
 use crate::crop::{CropRect, RectF};
 use crate::loader::{self, Detector, FolderData, Selection};
@@ -213,6 +214,9 @@ pub struct CropApp {
     instructions: Option<String>,
     show_instructions: bool,
 
+    /// The batch-crop window (a separate OS window) and its running job.
+    batch: BatchWindow,
+
     status: String,
 }
 
@@ -279,6 +283,7 @@ impl CropApp {
             close_after_save: false,
             show_instructions: instructions.is_some(),
             instructions,
+            batch: BatchWindow::new(),
             status,
         }
     }
@@ -861,13 +866,7 @@ impl CropApp {
         .unwrap_or_else(|| "cropped".to_owned());
         // Folder name in the on-disk frame, like the crop JSON.
         let disk = crop.to_disk(data.orientation, data.width, data.height);
-        let dest = parent.join(format!(
-            "cropped_x0{}_y0{}_x1{}_y1{}_{stem}",
-            disk.x,
-            disk.y,
-            disk.x1(),
-            disk.y1()
-        ));
+        let dest = parent.join(batch::export_folder_name(disk, &stem));
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.saving_rx = Some(rx);
@@ -893,6 +892,49 @@ impl CropApp {
             })();
             let _ = tx.send(result);
         });
+    }
+
+    // ----- batch crop window ----------------------------------------------
+
+    /// The crop and stack of the main window, as the batch window applies
+    /// them to other folders; `None` without a crop.
+    fn batch_ref(&self) -> Option<BatchRef> {
+        let data = self.data.as_ref()?;
+        let crop = self.crop_px()?;
+        Some(BatchRef {
+            crop,
+            width: data.width,
+            height: data.height,
+            orientation: data.orientation,
+            source: data.path.clone(),
+            detector_override: self.detector_override,
+            colormap: self.colormap,
+        })
+    }
+
+    /// The batch-crop window, a separate OS window (an embedded egui window
+    /// on backends without multiple viewports). Its job keeps running, and
+    /// is polled, while the window is closed.
+    fn batch_window(&mut self, ctx: &egui::Context) {
+        self.batch.poll(ctx);
+        if !self.batch.open {
+            return;
+        }
+        let reference = self.batch_ref();
+        self.batch.set_reference(reference);
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("batch_crop"),
+            egui::ViewportBuilder::default()
+                .with_title("VENUS Crop TIFF — Batch crop")
+                .with_inner_size([1040.0, 780.0])
+                .with_min_inner_size([640.0, 480.0]),
+            |ui, _class| {
+                self.batch.ui(ui);
+                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                    self.batch.open = false;
+                }
+            },
+        );
     }
 
     // ----- instructions modal ----------------------------------------------
@@ -1216,6 +1258,21 @@ impl CropApp {
                     .clicked()
                 {
                     self.save_stack_dialog();
+                }
+                if ui
+                    .add_enabled(
+                        self.crop_px().is_some() || self.batch.is_running(),
+                        egui::Button::new("🗄 Batch crop…"),
+                    )
+                    .on_hover_text(
+                        "Apply this crop to many other folders at once, in a separate \
+                         window: pick the folders, the sub-folder holding their images, \
+                         and an output folder",
+                    )
+                    .clicked()
+                {
+                    let reference = self.batch_ref();
+                    self.batch.show(reference);
                 }
                 if ui
                     .add_enabled(can_save, egui::Button::new("🗀 Export cropped stack…"))
@@ -1849,7 +1906,7 @@ fn folder_label(p: &Path) -> String {
 }
 
 /// Min/max of the finite values; `(inf, -inf)` when there are none.
-fn raw_range<I: Iterator<Item = f32>>(vals: I) -> (f32, f32) {
+pub(crate) fn raw_range<I: Iterator<Item = f32>>(vals: I) -> (f32, f32) {
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
     for v in vals {
         if v.is_finite() {
@@ -1860,7 +1917,7 @@ fn raw_range<I: Iterator<Item = f32>>(vals: I) -> (f32, f32) {
     (lo, hi)
 }
 
-fn normalize_range((lo, hi): (f32, f32)) -> (f32, f32) {
+pub(crate) fn normalize_range((lo, hi): (f32, f32)) -> (f32, f32) {
     if lo.is_finite() && hi.is_finite() {
         (lo, hi)
     } else {
@@ -1883,7 +1940,7 @@ const AUTO_MIN_COVER: f64 = 0.5;
 /// (Gaussian, uniform, bimodal) is left essentially untouched. Works on a
 /// strided sample of the finite values; falls back to `full` when the sample
 /// is too small or the range collapses.
-fn robust_range(frames: &[Array2<f32>], full: (f32, f32)) -> (f32, f32) {
+pub(crate) fn robust_range(frames: &[Array2<f32>], full: (f32, f32)) -> (f32, f32) {
     use rayon::prelude::*;
 
     let per_frame = (AUTO_SAMPLES / frames.len().max(1)).max(1);
@@ -2039,6 +2096,7 @@ impl eframe::App for CropApp {
 
         self.ensure_img_texture(&ctx);
         self.instructions_modal(&ctx);
+        self.batch_window(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             self.toolbar(ui);
