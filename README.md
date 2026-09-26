@@ -134,6 +134,18 @@ so in Python the crop is simply `frame[y:y+height, x:x+width]`. Only the four
 `x/y/width/height` keys are read back by `--crop-file`; the rest records what
 the crop was drawn on.
 
+A **tilted** region (see below) adds `center_x`, `center_y`, `box_width`,
+`box_height` and `angle_deg` — the rectangle as drawn on the displayed
+(oriented) frames, the angle in degrees, positive counter-clockwise on
+screen — and its `x`/`y`/`width`/`height` then hold the axis-aligned
+bounding box of the tilted region (still in the on-disk frame), so a reader
+that only knows the four keys still finds where the region is. Readers that
+understand the tilt (NeCTAR, `--crop-file`, `-c X,Y,W,H,A`) cut the tilted
+rectangle out straightened: every cropped image is `box_width × box_height`
+pixels, sampled bilinearly along the rectangle's own grid. The exported
+stack and images follow the same rule; a tilted region that sticks out of
+the image gets NaN where it samples outside.
+
 With `--output-stack`, the cropped stack itself is returned as a `.npy` file:
 `float32`, shape `(n_images, height, width)` — in Rust readable with
 `ndarray-npy`, in Python with `numpy.load`.
@@ -146,6 +158,15 @@ pixel values in the **Crop region** panel. The crop snaps to whole pixels.
 `Delete`/`Backspace` clears it, **↩ Undo** steps back, **⛶ Full image** selects
 everything, **↧ Use initial crop** returns to the region passed on the command
 line.
+
+The region can be **tilted**: drag the round handle above its top edge to
+rotate it about its center (hold Shift to snap to 5° steps), or type the
+angle in the **Angle** field; **⟲ Straighten** puts it back to 0°. The
+handles keep resizing along the tilted edges, the outside stays dimmed, and
+the verification statistics are taken on the straightened region. Angles
+within 0.75° of a multiple of 90° snap onto it, so a region rotated back by
+hand is exported pixel-exact again. The initial region can be given tilted
+too: `-c X,Y,WIDTH,HEIGHT,ANGLE` (the untilted rectangle plus its tilt).
 
 ## Making sure the crop does not cut anything important
 

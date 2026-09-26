@@ -6,7 +6,7 @@
 
 use crate::batch::{self, BatchRef, BatchWindow};
 use crate::colormap::Colormap;
-use crate::crop::{CropRect, RectF};
+use crate::crop::{OrientedBox, RectF};
 use crate::loader::{self, Detector, FolderData, Selection};
 use crate::stats::{self, CropStats};
 
@@ -21,6 +21,10 @@ use std::time::{Duration, Instant};
 const UNDO_DEPTH: usize = 24;
 const HANDLE_HIT: f32 = 10.0;
 const HANDLE_SIZE: f32 = 9.0;
+/// Screen distance between the crop's top edge and its rotation handle.
+const ROT_HANDLE_OFFSET: f32 = 26.0;
+/// Rotating with Shift held snaps the tilt to this many degrees.
+const ROT_SNAP_DEG: f32 = 5.0;
 const PLAY_FRAME_MS: u64 = 80;
 
 const CROP_COLOR: Color32 = Color32::from_rgb(0, 220, 160); // green
@@ -101,15 +105,14 @@ impl DisplayMode {
 
 /// Messages sent from the background loading thread to the UI.
 enum LoadMsg {
-    Progress { done: usize, total: usize },
+    Progress(loader::LoadProgress),
     Done(anyhow::Result<FolderData>),
 }
 
 /// A folder load in flight on a background thread.
 struct LoadJob {
     rx: Receiver<LoadMsg>,
-    done: usize,
-    total: usize,
+    progress: loader::LoadProgress,
 }
 
 /// A resize grab-point on the crop rectangle: -1/0/1 for left/middle/right and
@@ -174,24 +177,31 @@ pub struct CropApp {
     last_advance: Option<Instant>,
     dim_outside: bool,
 
-    // Crop model (all in the oriented/display frame of the loaded stack).
-    crop: Option<RectF>,
-    /// Crop passed on the command line (a previous session's crop), in the
-    /// on-disk frame of the files; shown as [`CropApp::initial_crop`].
-    initial_crop_disk: Option<CropRect>,
+    // Crop model (all in the oriented/display frame of the loaded stack): a
+    // rectangle, possibly tilted about its center.
+    crop: Option<OrientedBox>,
+    /// Crop passed on the command line (a previous session's crop). Untilted
+    /// it is in the on-disk frame of the files; a tilted one is on the
+    /// oriented frames, like the JSON's center / size / angle. Shown as
+    /// [`CropApp::initial_crop`].
+    initial_crop_disk: Option<OrientedBox>,
     /// [`CropApp::initial_crop_disk`] on the oriented frames of the loaded
     /// stack, kept as a dashed reference outline.
-    initial_crop: Option<CropRect>,
+    initial_crop: Option<OrientedBox>,
     /// Detector chosen by the user (toolbar combobox / `--detector`), which
     /// decides how the frames are oriented on load; `None` = guess it from
     /// the folder layout.
     detector_override: Option<Detector>,
-    undo: Vec<Option<RectF>>,
+    undo: Vec<Option<OrientedBox>>,
 
     // Interaction transients.
     drawing: bool,
     moving: bool,
     resizing: Option<Handle>,
+    /// A rotation-handle drag in progress: the constant offset between the
+    /// crop angle and the pointer's angle about the center, taken at grab
+    /// time so the handle doesn't jump under the pointer.
+    rotating: Option<f32>,
     drag_changed: bool, // an undo snapshot was taken for the current drag
     move_last: Option<(f32, f32)>,
     drag_start: Option<(f32, f32)>,
@@ -224,7 +234,7 @@ impl CropApp {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         inputs: Vec<PathBuf>,
-        initial_crop: Option<CropRect>,
+        initial_crop: Option<OrientedBox>,
         output_path: Option<PathBuf>,
         output_stack: Option<PathBuf>,
         called_from_app: bool,
@@ -268,6 +278,7 @@ impl CropApp {
             drawing: false,
             moving: false,
             resizing: None,
+            rotating: None,
             drag_changed: false,
             move_last: None,
             drag_start: None,
@@ -308,7 +319,7 @@ impl CropApp {
     fn detector_combo(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.label("Detector:").on_hover_text(
             "How the frames are oriented on load: Timepix → transposed, CCD → flipped \
-             vertically, QHY → not decided yet (as-is). 'auto' recognizes the detector from \
+             vertically, QHY → rotated 90° counterclockwise. 'auto' recognizes the detector from \
              the folder layout (images/tpx1, images/ikonxl, …). The crop is drawn on the \
              oriented image; the saved crop and every cropped file are in the on-disk frame \
              of the input files.",
@@ -347,8 +358,14 @@ impl CropApp {
                 }
             });
         if let Some(d) = self.data.as_ref() {
-            ui.label(egui::RichText::new(d.orientation.label()).weak())
-                .on_hover_text(d.detector.detector().description());
+            ui.label(egui::RichText::new(orientation_note(d)).weak())
+                .on_hover_text(if d.path.is_dir() {
+                    d.detector.detector().description().to_owned()
+                } else {
+                    "A .npy stack is shown exactly as it is: the application that wrote it \
+                     (e.g. NeCTAR) already oriented the frames for this detector."
+                        .to_owned()
+                });
         }
         if changed && let Some(idx) = self.selected_input {
             self.select_input(idx, ctx);
@@ -362,10 +379,12 @@ impl CropApp {
         }
     }
 
-    /// The integer crop currently on the image, if any.
-    fn crop_px(&self) -> Option<CropRect> {
+    /// The crop as it would be saved (size snapped to whole pixels, angle
+    /// canonical; untilted crops on the pixel grid inside the image), if a
+    /// valid one is on the image.
+    fn crop_box(&self) -> Option<OrientedBox> {
         let data = self.data.as_ref()?;
-        self.crop?.to_crop(data.width, data.height)
+        self.crop?.snapped(data.width, data.height)
     }
 
     // ----- input loading -----------------------------------------------------
@@ -384,9 +403,9 @@ impl CropApp {
             // The parallel loader reports progress from worker threads, so the
             // sender goes behind a mutex.
             let progress_tx = Mutex::new(tx.clone());
-            let result = loader::load_input_with_progress(&dir, detector, |done, total| {
+            let result = loader::load_input_with_progress(&dir, detector, |progress| {
                 if let Ok(tx) = progress_tx.lock() {
-                    let _ = tx.send(LoadMsg::Progress { done, total });
+                    let _ = tx.send(LoadMsg::Progress(progress.clone()));
                 }
                 ctx.request_repaint();
             });
@@ -396,7 +415,10 @@ impl CropApp {
 
         // Replacing an in-flight job drops its receiver; the stale thread's
         // sends fail silently and its result is discarded.
-        self.loading = Some(LoadJob { rx, done: 0, total: 0 });
+        self.loading = Some(LoadJob {
+            rx,
+            progress: loader::LoadProgress::default(),
+        });
     }
 
     fn poll_load(&mut self) {
@@ -404,9 +426,17 @@ impl CropApp {
         if let Some(job) = &mut self.loading {
             while let Ok(msg) = job.rx.try_recv() {
                 match msg {
-                    LoadMsg::Progress { done, total } => {
-                        job.done = done;
-                        job.total = total;
+                    LoadMsg::Progress(progress) => {
+                        // A .npy stack: say how many images the file holds.
+                        if !progress.stack_file.is_empty() && self.status.starts_with("Loading ") {
+                            self.status = format!(
+                                "Loading {} image{} from {}…",
+                                progress.frames_total,
+                                if progress.frames_total == 1 { "" } else { "s" },
+                                progress.stack_file
+                            );
+                        }
+                        job.progress = progress;
                     }
                     LoadMsg::Done(res) => result = Some(res),
                 }
@@ -437,22 +467,27 @@ impl CropApp {
         }
         // The command-line crop is in the on-disk frame: show it on the
         // oriented frames of this stack.
+        // (A tilted one is already on the oriented frames.)
         let (disk_w, disk_h) = data.disk_dims();
-        self.initial_crop = self
-            .initial_crop_disk
-            .map(|c| c.from_disk(data.orientation, disk_w, disk_h));
+        self.initial_crop = self.initial_crop_disk.map(|b| match b.as_crop(disk_w, disk_h) {
+            Some(c) if b.is_axis_aligned() => {
+                OrientedBox::from_crop(c.from_disk(data.orientation, disk_w, disk_h))
+            }
+            _ => b,
+        });
         self.drawing = false;
         self.moving = false;
         self.resizing = None;
+        self.rotating = None;
         self.playing = false;
 
         // Show the initial (previous-session) crop as the starting region.
         let mut crop_note = String::new();
         if self.crop.is_none() {
             if let Some(init) = self.initial_crop {
-                match init.clamp_to(w, h) {
+                match init.snapped(w, h) {
                     Some(c) => {
-                        self.crop = Some(c.to_rectf());
+                        self.crop = Some(c);
                         if c != init {
                             crop_note = " — initial crop clipped to the image".to_owned();
                         }
@@ -492,7 +527,7 @@ impl CropApp {
             "Loaded {} images ({w}×{h} px, {}: {}) from {}{crop_note}",
             data.n_frames(),
             data.detector.summary(),
-            data.orientation,
+            orientation_note(&data),
             folder_label(&data.path),
         );
 
@@ -528,7 +563,7 @@ impl CropApp {
         }
         let Some(data) = &self.data else { return };
         self.stats_dirty = false;
-        let Some(crop) = self.crop_px() else {
+        let Some(crop) = self.crop_box() else {
             self.stats = None;
             return;
         };
@@ -538,7 +573,7 @@ impl CropApp {
         let band = self.edge_band.max(1);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let out = stats::compute(&data.frames, &data.frame_totals, crop, band);
+            let out = stats::compute_oriented(&data.frames, &data.frame_totals, &crop, band);
             let _ = tx.send(out);
             ctx.request_repaint();
         });
@@ -560,7 +595,7 @@ impl CropApp {
         self.stats_dirty = true;
     }
 
-    fn set_crop(&mut self, crop: Option<RectF>) {
+    fn set_crop(&mut self, crop: Option<OrientedBox>) {
         if self.crop != crop {
             self.push_undo();
             self.crop = crop;
@@ -568,13 +603,14 @@ impl CropApp {
         }
     }
 
-    /// Snap the live rectangle to whole pixels (as saved); drop it when it is
-    /// degenerate, restoring the pre-drag state.
+    /// Snap the live crop to whole-pixel sizes (as saved; untilted ones onto
+    /// the pixel grid); drop it when it is degenerate or entirely off the
+    /// image, restoring the pre-drag state.
     fn snap_crop(&mut self) {
         let Some(data) = &self.data else { return };
-        if let Some(r) = self.crop {
-            match r.to_crop(data.width, data.height) {
-                Some(c) => self.crop = Some(c.to_rectf()),
+        if let Some(b) = self.crop {
+            match b.snapped(data.width, data.height) {
+                Some(c) => self.crop = Some(c),
                 None => self.undo(),
             }
         }
@@ -679,7 +715,7 @@ impl CropApp {
         if self.saving_rx.is_some() {
             return;
         }
-        let (Some(data), Some(crop)) = (self.data.clone(), self.crop_px()) else {
+        let (Some(data), Some(crop)) = (self.data.clone(), self.crop_box()) else {
             self.status = "Nothing to save — draw a crop region first.".to_owned();
             return;
         };
@@ -696,7 +732,7 @@ impl CropApp {
             let result = (|| -> Result<String, String> {
                 let mut notes: Vec<String> = Vec::new();
                 if let Some(stack_path) = &stack_dest {
-                    loader::write_cropped_stack(stack_path, &data.frames, crop, data.orientation)
+                    loader::write_cropped_stack(stack_path, &data.frames, &crop, data.orientation)
                         .map_err(|e| format!("Failed to write {}: {e:#}", stack_path.display()))?;
                     notes.push(format!("cropped stack → {}", stack_path.display()));
                 }
@@ -853,7 +889,7 @@ impl CropApp {
         if self.saving_rx.is_some() {
             return;
         }
-        let (Some(data), Some(crop)) = (self.data.clone(), self.crop_px()) else {
+        let (Some(data), Some(crop)) = (self.data.clone(), self.crop_box()) else {
             self.status = "Nothing to export — draw a crop region first.".to_owned();
             return;
         };
@@ -864,8 +900,8 @@ impl CropApp {
         }
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "cropped".to_owned());
-        // Folder name in the on-disk frame, like the crop JSON.
-        let disk = crop.to_disk(data.orientation, data.width, data.height);
+        // Folder name from the bounds in the on-disk frame, like the crop JSON.
+        let disk = crop.disk_bounds(data.orientation, data.width, data.height);
         let dest = parent.join(batch::export_folder_name(disk, &stem));
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -875,7 +911,7 @@ impl CropApp {
 
         std::thread::spawn(move || {
             let result = (|| -> Result<String, String> {
-                let mut notes = loader::export_cropped_images(&dest, &data, crop)
+                let mut notes = loader::export_cropped_images(&dest, &data, &crop)
                     .map_err(|e| format!("Export failed: {e:#}"))?;
                 let json = crop.to_json(
                     data.width,
@@ -900,7 +936,7 @@ impl CropApp {
     /// them to other folders; `None` without a crop.
     fn batch_ref(&self) -> Option<BatchRef> {
         let data = self.data.as_ref()?;
-        let crop = self.crop_px()?;
+        let crop = self.crop_box()?;
         Some(BatchRef {
             crop,
             width: data.width,
@@ -1148,7 +1184,7 @@ impl CropApp {
                 .clicked()
             {
                 if let Some(data) = &self.data {
-                    let full = CropRect::full(data.width, data.height).to_rectf();
+                    let full = OrientedBox::full(data.width, data.height);
                     self.set_crop(Some(full));
                 }
             }
@@ -1159,8 +1195,8 @@ impl CropApp {
                     .clicked()
                 {
                     if let Some(data) = &self.data {
-                        match init.clamp_to(data.width, data.height) {
-                            Some(c) => self.set_crop(Some(c.to_rectf())),
+                        match init.snapped(data.width, data.height) {
+                            Some(c) => self.set_crop(Some(c)),
                             None => {
                                 self.status =
                                     "Initial crop is outside this image — not applied.".to_owned()
@@ -1168,6 +1204,16 @@ impl CropApp {
                         }
                     }
                 }
+            }
+            if let Some(b) = self.crop
+                && b.angle_deg != 0.0
+                && ui
+                    .button("⟲ Straighten")
+                    .on_hover_text("Reset the tilt of the crop region to 0° (keeping its center and size)")
+                    .clicked()
+            {
+                self.set_crop(Some(OrientedBox { angle_deg: 0.0, ..b }));
+                self.snap_crop();
             }
             if ui
                 .add_enabled(self.crop.is_some(), egui::Button::new("🗑 Clear"))
@@ -1203,7 +1249,7 @@ impl CropApp {
             // Save buttons sit at the far right; lay them out first so the
             // status text on the left can take the remaining width.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let can_save = self.crop_px().is_some() && self.saving_rx.is_none();
+                let can_save = self.crop_box().is_some() && self.saving_rx.is_none();
 
                 // Save-and-quit / return-to-caller button, when there is
                 // somewhere for the result to go.
@@ -1244,7 +1290,7 @@ impl CropApp {
                 }
                 if ui
                     .add_enabled(can_save, egui::Button::new("💾 Save as JSON…"))
-                    .on_hover_text("Write the crop region (x, y, width, height) to a JSON file")
+                    .on_hover_text("Write the crop region (x, y, width, height — plus center and angle when tilted) to a JSON file")
                     .clicked()
                 {
                     self.save_crop_dialog();
@@ -1261,7 +1307,7 @@ impl CropApp {
                 }
                 if ui
                     .add_enabled(
-                        self.crop_px().is_some() || self.batch.is_running(),
+                        self.crop_box().is_some() || self.batch.is_running(),
                         egui::Button::new("🗄 Batch crop…"),
                     )
                     .on_hover_text(
@@ -1336,53 +1382,96 @@ impl CropApp {
         };
         let (w, h) = (data.width, data.height);
 
-        match self.crop_px() {
+        match self.crop_box() {
             None => {
-                ui.label("Drag a rectangle on the image to define the crop.");
+                ui.label(
+                    "Drag a rectangle on the image to define the crop; the round handle \
+                     above it tilts the region (Shift snaps to 5°).",
+                );
             }
             Some(crop) => {
                 if self.edit_crop_fields(ui, crop, w, h) {
                     self.stats_dirty = true;
                 }
                 ui.add_space(4.0);
-                let kept = 100.0 * crop.area() as f64 / (w * h) as f64;
+                let (ow, oh) = crop.out_size();
+                let kept = 100.0 * crop.area() / (w * h) as f64;
                 ui.label(format!(
-                    "Keeps {kept:.1}% of the pixels — {w}×{h} → {}×{}",
-                    crop.width, crop.height
+                    "Keeps {kept:.1}% of the pixels — {w}×{h} → {ow}×{oh}{}",
+                    if crop.is_axis_aligned() {
+                        String::new()
+                    } else {
+                        format!(" (tilted {:+.1}°, exported straightened)", crop.angle_deg)
+                    }
                 ));
                 let n = data.n_frames();
                 ui.label(format!(
                     "Stack in memory (f32): {} → {}",
                     human_bytes((n * w * h * 4) as f64),
-                    human_bytes((n * crop.area() * 4) as f64),
+                    human_bytes((n * ow * oh * 4) as f64),
                 ));
-                if !data.orientation.is_identity() {
-                    let disk = crop.to_disk(data.orientation, w, h);
+                if !crop.is_axis_aligned() {
+                    let bb = crop.bounding();
+                    let out = bb.x0 < 0.0 || bb.y0 < 0.0 || bb.x1 > w as f32 || bb.y1 > h as f32;
                     ui.label(
-                        egui::RichText::new(format!(
-                            "Saved in the on-disk frame ({}: {}): x={} y={} {}×{}",
-                            data.detector.detector().label(),
-                            data.orientation,
-                            disk.x,
-                            disk.y,
-                            disk.width,
-                            disk.height
-                        ))
+                        egui::RichText::new(if out {
+                            "⚠ The tilted region sticks out of the image: the pixels sampled \
+                             outside come out as NaN (no data)."
+                        } else {
+                            "The region is resampled bilinearly on its own grid: every \
+                             exported image is box width × box height pixels, straightened."
+                        })
                         .small(),
-                    )
-                    .on_hover_text(
-                        "The image is shown re-oriented for this detector; the crop JSON, the \
-                         cropped stack and the exported images use the coordinates of the files \
-                         as they are on disk.",
                     );
+                }
+                if !data.orientation.is_identity() {
+                    if let Some(c) = crop.as_crop(w, h) {
+                        let disk = c.to_disk(data.orientation, w, h);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Saved in the on-disk frame ({}: {}): x={} y={} {}×{}",
+                                data.detector.detector().label(),
+                                data.orientation,
+                                disk.x,
+                                disk.y,
+                                disk.width,
+                                disk.height
+                            ))
+                            .small(),
+                        )
+                        .on_hover_text(
+                            "The image is shown re-oriented for this detector; the crop JSON, the \
+                             cropped stack and the exported images use the coordinates of the files \
+                             as they are on disk.",
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Tilted region: center / size / angle are saved as drawn ({}: {}); \
+                                 x, y, width, height carry its bounding box in the on-disk frame.",
+                                data.detector.detector().label(),
+                                data.orientation,
+                            ))
+                            .small(),
+                        );
+                    }
                 }
             }
         }
         if let Some(init) = self.initial_crop {
+            let (ix0, iy0) = (init.cx - init.width * 0.5, init.cy - init.height * 0.5);
             ui.label(
                 egui::RichText::new(format!(
-                    "Initial crop (dashed orange): x={} y={} {}×{}",
-                    init.x, init.y, init.width, init.height
+                    "Initial crop (dashed orange): x={:.0} y={:.0} {:.0}×{:.0}{}",
+                    ix0,
+                    iy0,
+                    init.width,
+                    init.height,
+                    if init.angle_deg == 0.0 {
+                        String::new()
+                    } else {
+                        format!(" @ {:+.1}°", init.angle_deg)
+                    }
                 ))
                 .small()
                 .color(INITIAL_CROP_COLOR),
@@ -1430,7 +1519,7 @@ impl CropApp {
         });
 
         let Some(stats) = &self.stats else {
-            if self.crop_px().is_none() {
+            if self.crop_box().is_none() {
                 ui.label("Draw a crop region to see its per-image statistics.");
             }
             return;
@@ -1490,34 +1579,63 @@ impl CropApp {
         }
     }
 
-    /// Numeric editor for the crop (integer pixels). Returns whether anything
-    /// changed.
-    fn edit_crop_fields(&mut self, ui: &mut egui::Ui, crop: CropRect, w: usize, h: usize) -> bool {
-        let (mut x, mut y) = (crop.x as i64, crop.y as i64);
-        let (mut cw, mut ch) = (crop.width as i64, crop.height as i64);
+    /// Numeric editor for the crop: the top-left corner and size of the
+    /// untilted rectangle (integer pixels) plus its tilt about the center.
+    /// Returns whether anything changed.
+    fn edit_crop_fields(&mut self, ui: &mut egui::Ui, crop: OrientedBox, w: usize, h: usize) -> bool {
+        let (mut x, mut y) = (
+            (crop.cx - crop.width * 0.5).round() as i64,
+            (crop.cy - crop.height * 0.5).round() as i64,
+        );
+        let (mut cw, mut ch) = (crop.width.round() as i64, crop.height.round() as i64);
+        let mut angle = crop.angle_deg;
         let mut changed = false;
+        let tilted = crop.angle_deg != 0.0;
+        let (max_w, max_h) = if tilted { ((w.max(h) * 2) as i64, (w.max(h) * 2) as i64) } else { (w as i64, h as i64) };
+        let (min_xy, max_x, max_y) = if tilted {
+            (-(w.max(h) as i64), (2 * w) as i64, (2 * h) as i64)
+        } else {
+            (0, w as i64 - 1, h as i64 - 1)
+        };
         egui::Grid::new("crop_grid")
             .num_columns(4)
             .spacing([6.0, 2.0])
             .show(ui, |ui| {
-                changed |= int_field(ui, "X", &mut x, 0, w as i64 - 1);
-                changed |= int_field(ui, "Width", &mut cw, 1, w as i64);
+                changed |= int_field(ui, "X", &mut x, min_xy, max_x);
+                changed |= int_field(ui, "Width", &mut cw, 1, max_w);
                 ui.end_row();
-                changed |= int_field(ui, "Y", &mut y, 0, h as i64 - 1);
-                changed |= int_field(ui, "Height", &mut ch, 1, h as i64);
+                changed |= int_field(ui, "Y", &mut y, min_xy, max_y);
+                changed |= int_field(ui, "Height", &mut ch, 1, max_h);
+                ui.end_row();
+                ui.label("Angle");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut angle)
+                            .speed(0.2)
+                            .range(-180.0..=180.0)
+                            .suffix("°")
+                            .fixed_decimals(1),
+                    )
+                    .on_hover_text(
+                        "Tilt of the crop region about its center, positive counter-clockwise; \
+                         drag the round handle above the region to rotate it (Shift snaps to 5°)",
+                    )
+                    .changed();
                 ui.end_row();
             });
         if changed {
-            let c = CropRect {
-                x: x as usize,
-                y: y as usize,
-                width: cw.max(1) as usize,
-                height: ch.max(1) as usize,
+            let (cw, ch) = (cw.max(1) as f32, ch.max(1) as f32);
+            let b = OrientedBox {
+                cx: x as f32 + cw * 0.5,
+                cy: y as f32 + ch * 0.5,
+                width: cw,
+                height: ch,
+                angle_deg: angle,
             };
-            if let Some(c) = c.clamp_to(w, h) {
+            if let Some(b) = b.snapped(w, h) {
                 // A direct numeric edit is undoable like a drag.
                 self.push_undo();
-                self.crop = Some(c.to_rectf());
+                self.crop = Some(b);
             }
         }
         changed
@@ -1525,17 +1643,14 @@ impl CropApp {
 
     fn viewer(&mut self, ui: &mut egui::Ui) {
         if let Some(job) = &self.loading {
-            let frac = if job.total > 0 {
-                job.done as f32 / job.total as f32
-            } else {
-                0.0
-            };
+            // A folder counts files; a .npy stack handed over by NeCTAR is
+            // one file, so the text names its images and the bytes read.
             ui.centered_and_justified(|ui| {
                 ui.add_sized(
-                    [320.0, 24.0],
-                    egui::ProgressBar::new(frac)
+                    [420.0, 24.0],
+                    egui::ProgressBar::new(job.progress.fraction())
                         .show_percentage()
-                        .text(format!("⏳ Loading {} / {} files", job.done, job.total)),
+                        .text(format!("⏳ Loading {}", job.progress.text())),
                 );
             });
             return;
@@ -1671,6 +1786,9 @@ impl CropApp {
         h: usize,
         data: &FolderData,
     ) {
+        // Set while the pointer is on (or dragging) the rotation handle: the
+        // OS arrow is replaced by a rotation glyph painted at this position.
+        let mut rotate_cursor: Option<Pos2> = None;
         let scale = self.scale;
         let to_img =
             |p: Pos2| -> (f32, f32) { ((p.x - rect.left()) / scale, (p.y - rect.top()) / scale) };
@@ -1688,7 +1806,20 @@ impl CropApp {
             }
         }
 
-        // Resize a handle, move the crop, or draw a new one (replacing the old).
+        // Image-space offset of the rotation handle above the crop's top edge
+        // (constant on screen, whatever the zoom).
+        let rot_offset = ROT_HANDLE_OFFSET / scale;
+        let rot_handle_pos =
+            |b: &OrientedBox| -> (f32, f32) { b.from_local(0.0, -b.height * 0.5 - rot_offset) };
+        // Crop angle that puts the rotation handle at the given image point:
+        // the handle sits along the box's -v axis, which is (-sin, -cos) of
+        // the angle (positive angles are counter-clockwise on screen).
+        let angle_to = |b: &OrientedBox, px: f32, py: f32| -> f32 {
+            (-(px - b.cx)).atan2(-(py - b.cy)).to_degrees()
+        };
+
+        // Rotate, resize a handle, move the crop, or draw a new one
+        // (replacing the old).
         if response.drag_started() {
             self.drag_changed = false;
             let press = painter
@@ -1700,32 +1831,39 @@ impl CropApp {
                 let start = to_img(sp);
                 let mut acted = false;
 
-                if let Some(r) = self.crop {
-                    // 1) A resize handle of the crop.
-                    if let Some(hd) = crop_handles(&r).into_iter().find_map(|(hd, (ix, iy))| {
-                        (to_screen(ix, iy).distance(sp) <= HANDLE_HIT).then_some(hd)
-                    }) {
+                if let Some(b) = self.crop {
+                    let (rx, ry) = rot_handle_pos(&b);
+                    // 1) The rotation handle.
+                    if to_screen(rx, ry).distance(sp) <= HANDLE_HIT {
+                        self.rotating = Some(b.angle_deg - angle_to(&b, start.0, start.1));
+                        acted = true;
+                    } else if let Some(hd) =
+                        // 2) A resize handle of the crop.
+                        crop_handles(&b).into_iter().find_map(|(hd, (ix, iy))| {
+                            (to_screen(ix, iy).distance(sp) <= HANDLE_HIT).then_some(hd)
+                        })
+                    {
                         self.resizing = Some(hd);
                         acted = true;
-                    } else if r.contains(start.0, start.1) {
-                        // 2) Grab the crop to move it.
+                    } else if b.contains(start.0, start.1) {
+                        // 3) Grab the crop to move it.
                         self.moving = true;
                         self.move_last = cur.or(Some(start));
                         acted = true;
                     }
                 }
 
-                // 3) Otherwise start drawing a new crop (snapshot now, so undo
+                // 4) Otherwise start drawing a new crop (snapshot now, so undo
                 //    restores the previous one).
                 if !acted {
                     self.push_undo();
                     self.drag_changed = true;
-                    self.crop = Some(RectF {
+                    self.crop = Some(OrientedBox::from_rectf(RectF {
                         x0: start.0,
                         y0: start.1,
                         x1: start.0,
                         y1: start.1,
-                    });
+                    }));
                     self.drawing = true;
                     self.drag_start = Some(start);
                 }
@@ -1734,32 +1872,47 @@ impl CropApp {
 
         if response.dragged() {
             let cur = response.interact_pointer_pos().map(to_img);
-            // Snapshot once, on the first real movement of a move/resize.
-            if (self.moving || self.resizing.is_some()) && !self.drag_changed {
+            // Snapshot once, on the first real movement of a move/resize/rotate.
+            if (self.moving || self.resizing.is_some() || self.rotating.is_some())
+                && !self.drag_changed
+            {
                 self.push_undo();
                 self.drag_changed = true;
             }
-            if let Some(hd) = self.resizing {
-                if let (Some(c), Some(r)) = (cur, self.crop.as_mut()) {
-                    resize_rect(r, hd, c);
+            if let Some(offset) = self.rotating {
+                rotate_cursor = response.interact_pointer_pos();
+                if let Some(c) = cur {
+                    let snap = painter.ctx().input(|i| i.modifiers.shift);
+                    if let Some(b) = self.crop.as_mut() {
+                        let mut a = angle_to(b, c.0, c.1) + offset;
+                        if snap {
+                            a = (a / ROT_SNAP_DEG).round() * ROT_SNAP_DEG;
+                        }
+                        b.angle_deg = a;
+                        self.stats_dirty = true;
+                    }
+                }
+            } else if let Some(hd) = self.resizing {
+                if let (Some(c), Some(b)) = (cur, self.crop.as_mut()) {
+                    resize_oriented(b, hd, c);
                     self.stats_dirty = true;
                 }
             } else if self.moving {
                 if let (Some(last), Some(c)) = (self.move_last, cur) {
-                    if let Some(r) = self.crop.as_mut() {
-                        r.translate(c.0 - last.0, c.1 - last.1);
+                    if let Some(b) = self.crop.as_mut() {
+                        b.translate(c.0 - last.0, c.1 - last.1);
                         self.stats_dirty = true;
                     }
                     self.move_last = cur;
                 }
             } else if self.drawing {
                 if let (Some(a), Some(c)) = (self.drag_start, cur) {
-                    self.crop = Some(RectF {
+                    self.crop = Some(OrientedBox::from_rectf(RectF {
                         x0: a.0,
                         y0: a.1,
                         x1: c.0,
                         y1: c.1,
-                    });
+                    }));
                     self.stats_dirty = true;
                 }
             }
@@ -1779,6 +1932,7 @@ impl CropApp {
             self.drawing = false;
             self.moving = false;
             self.resizing = None;
+            self.rotating = None;
             self.drag_changed = false;
             self.move_last = None;
             self.drag_start = None;
@@ -1786,17 +1940,21 @@ impl CropApp {
             self.stats_dirty = true;
         }
 
-        // Hover cursor: resize over a handle, grab inside the crop.
+        // Hover cursor: rotate over the rotation handle, resize over a
+        // handle, grab inside the crop.
         if !response.dragged() {
-            if let (Some(hp), Some(r)) = (response.hover_pos(), self.crop) {
-                let over = crop_handles(&r).into_iter().find_map(|(hd, (ix, iy))| {
+            if let (Some(hp), Some(b)) = (response.hover_pos(), self.crop) {
+                let (rx, ry) = rot_handle_pos(&b);
+                let over_handle = crop_handles(&b).into_iter().find_map(|(hd, (ix, iy))| {
                     (to_screen(ix, iy).distance(hp) <= HANDLE_HIT).then_some(hd)
                 });
-                if let Some(hd) = over {
-                    painter.ctx().set_cursor_icon(cursor_for_handle(hd));
+                if to_screen(rx, ry).distance(hp) <= HANDLE_HIT {
+                    rotate_cursor = Some(hp);
+                } else if let Some(hd) = over_handle {
+                    painter.ctx().set_cursor_icon(cursor_for_handle(&b, hd));
                 } else {
                     let (ix, iy) = to_img(hp);
-                    if r.contains(ix, iy) {
+                    if b.contains(ix, iy) {
                         painter.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                     }
                 }
@@ -1813,67 +1971,53 @@ impl CropApp {
             self.set_crop(None);
         }
 
-        // Dim the region the crop throws away.
-        if self.dim_outside {
-            if let Some(r) = self.crop.map(RectF::normalized) {
-                let c = Rect::from_min_max(to_screen(r.x0, r.y0), to_screen(r.x1, r.y1))
-                    .intersect(rect);
-                let dim = Color32::from_black_alpha(140);
-                if c.is_positive() {
-                    let zero = egui::CornerRadius::ZERO;
-                    painter.rect_filled(
-                        Rect::from_min_max(rect.min, Pos2::new(rect.right(), c.top())),
-                        zero,
-                        dim,
-                    );
-                    painter.rect_filled(
-                        Rect::from_min_max(Pos2::new(rect.left(), c.bottom()), rect.max),
-                        zero,
-                        dim,
-                    );
-                    painter.rect_filled(
-                        Rect::from_min_max(
-                            Pos2::new(rect.left(), c.top()),
-                            Pos2::new(c.left(), c.bottom()),
-                        ),
-                        zero,
-                        dim,
-                    );
-                    painter.rect_filled(
-                        Rect::from_min_max(
-                            Pos2::new(c.right(), c.top()),
-                            Pos2::new(rect.right(), c.bottom()),
-                        ),
-                        zero,
-                        dim,
-                    );
-                }
+        // Dim the region the crop throws away: darken the whole image, then
+        // repaint the inside of the (possibly tilted) crop undimmed as a
+        // textured quad — the corners' image coordinates are the UVs.
+        if self.dim_outside
+            && let (Some(b), Some(tex)) = (self.crop, &self.img_tex)
+        {
+            painter.rect_filled(rect, egui::CornerRadius::ZERO, Color32::from_black_alpha(140));
+            let mut mesh = egui::Mesh::with_texture(tex.id());
+            for (ix, iy) in b.corners() {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: to_screen(ix, iy),
+                    uv: Pos2::new(ix / w as f32, iy / h as f32),
+                    color: Color32::WHITE,
+                });
             }
+            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            painter.add(mesh);
         }
 
         // Initial (previous-session) crop as a dashed reference outline.
-        if let Some(init) = self.initial_crop {
-            let differs = self.crop_px() != Some(init);
-            if differs {
-                draw_dashed_rect(
-                    painter,
-                    to_screen(init.x as f32, init.y as f32),
-                    to_screen(init.x1() as f32, init.y1() as f32),
-                    INITIAL_CROP_COLOR,
-                );
-            }
+        if let Some(init) = self.initial_crop
+            && self.crop_box() != Some(init)
+        {
+            let corners = init.corners().map(|(ix, iy)| to_screen(ix, iy));
+            draw_dashed_polygon(painter, &corners, INITIAL_CROP_COLOR);
         }
 
-        // The crop itself, with handles.
-        if let Some(r) = self.crop.map(RectF::normalized) {
-            let screen = Rect::from_min_max(to_screen(r.x0, r.y0), to_screen(r.x1, r.y1));
-            painter.rect_stroke(
-                screen,
-                egui::CornerRadius::ZERO,
-                Stroke::new(2.0, CROP_COLOR),
-                egui::StrokeKind::Middle,
-            );
-            for (_hd, (ix, iy)) in crop_handles(&r) {
+        // The crop itself, with the resize handles and the rotation handle.
+        if let Some(b) = self.crop {
+            let corners = b.corners().map(|(ix, iy)| to_screen(ix, iy));
+            let stroke = Stroke::new(2.0, CROP_COLOR);
+            for k in 0..4 {
+                painter.line_segment([corners[k], corners[(k + 1) % 4]], stroke);
+            }
+            // Rotation handle: a stem from the top edge with a round knob.
+            let top_mid = {
+                let (ix, iy) = b.from_local(0.0, -b.height * 0.5);
+                to_screen(ix, iy)
+            };
+            let knob = {
+                let (ix, iy) = rot_handle_pos(&b);
+                to_screen(ix, iy)
+            };
+            painter.line_segment([top_mid, knob], Stroke::new(1.5, CROP_COLOR));
+            painter.circle_filled(knob, HANDLE_SIZE * 0.55, Color32::WHITE);
+            painter.circle_stroke(knob, HANDLE_SIZE * 0.55, Stroke::new(1.5, Color32::BLACK));
+            for (_hd, (ix, iy)) in crop_handles(&b) {
                 let hr = Rect::from_center_size(to_screen(ix, iy), egui::vec2(HANDLE_SIZE, HANDLE_SIZE));
                 painter.rect_filled(hr, egui::CornerRadius::ZERO, Color32::WHITE);
                 painter.rect_stroke(
@@ -1883,6 +2027,22 @@ impl CropApp {
                     egui::StrokeKind::Middle,
                 );
             }
+        }
+
+        // No native rotation cursor exists, so hide the arrow and paint a
+        // rotation glyph at the pointer instead (painted last, over the crop).
+        if let Some(p) = rotate_cursor {
+            painter.ctx().set_cursor_icon(egui::CursorIcon::None);
+            let font = egui::FontId::proportional(20.0);
+            for d in [
+                egui::vec2(-1.0, 0.0),
+                egui::vec2(1.0, 0.0),
+                egui::vec2(0.0, -1.0),
+                egui::vec2(0.0, 1.0),
+            ] {
+                painter.text(p + d, egui::Align2::CENTER_CENTER, "↻", font.clone(), Color32::BLACK);
+            }
+            painter.text(p, egui::Align2::CENTER_CENTER, "↻", font, Color32::WHITE);
         }
     }
 }
@@ -2018,67 +2178,73 @@ fn int_field(ui: &mut egui::Ui, label: &str, v: &mut i64, min: i64, max: i64) ->
 }
 
 /// Image-space positions of the 8 resize handles of the crop rectangle.
-fn crop_handles(r: &RectF) -> Vec<(Handle, (f32, f32))> {
-    let n = r.normalized();
-    let (midx, midy) = ((n.x0 + n.x1) * 0.5, (n.y0 + n.y1) * 0.5);
+fn crop_handles(b: &OrientedBox) -> Vec<(Handle, (f32, f32))> {
+    let (hw, hh) = (b.width * 0.5, b.height * 0.5);
     let mut out = Vec::with_capacity(8);
     for vy in [-1i8, 0, 1] {
         for hx in [-1i8, 0, 1] {
             if hx == 0 && vy == 0 {
                 continue;
             }
-            let x = match hx {
-                -1 => n.x0,
-                1 => n.x1,
-                _ => midx,
-            };
-            let y = match vy {
-                -1 => n.y0,
-                1 => n.y1,
-                _ => midy,
-            };
-            out.push((Handle { hx, vy }, (x, y)));
+            let p = b.from_local(hx as f32 * hw, vy as f32 * hh);
+            out.push((Handle { hx, vy }, p));
         }
     }
     out
 }
 
-fn resize_rect(r: &mut RectF, handle: Handle, p: (f32, f32)) {
-    let mut n = r.normalized();
+/// Drag a resize handle to the image point `p`: the grabbed edge(s) follow
+/// the pointer in the crop's own frame, the opposite edge stays fixed in
+/// image space, and the tilt is unchanged.
+fn resize_oriented(b: &mut OrientedBox, handle: Handle, p: (f32, f32)) {
+    let (lu, lv) = b.to_local(p.0, p.1);
+    let (mut u0, mut u1) = (-b.width * 0.5, b.width * 0.5);
+    let (mut v0, mut v1) = (-b.height * 0.5, b.height * 0.5);
     match handle.hx {
-        -1 => n.x0 = p.0,
-        1 => n.x1 = p.0,
+        -1 => u0 = lu,
+        1 => u1 = lu,
         _ => {}
     }
     match handle.vy {
-        -1 => n.y0 = p.1,
-        1 => n.y1 = p.1,
+        -1 => v0 = lv,
+        1 => v1 = lv,
         _ => {}
     }
-    *r = n;
+    let (nu0, nu1) = (u0.min(u1), u0.max(u1));
+    let (nv0, nv1) = (v0.min(v1), v0.max(v1));
+    let (ncx, ncy) = b.from_local((nu0 + nu1) * 0.5, (nv0 + nv1) * 0.5);
+    b.cx = ncx;
+    b.cy = ncy;
+    b.width = nu1 - nu0;
+    b.height = nv1 - nv0;
 }
 
-fn cursor_for_handle(handle: Handle) -> egui::CursorIcon {
-    match (handle.hx, handle.vy) {
-        (0, _) => egui::CursorIcon::ResizeVertical,
-        (_, 0) => egui::CursorIcon::ResizeHorizontal,
-        (hx, vy) if hx == vy => egui::CursorIcon::ResizeNwSe,
-        _ => egui::CursorIcon::ResizeNeSw,
+/// The resize cursor matching the handle's outward direction on screen,
+/// whatever the crop's tilt.
+fn cursor_for_handle(b: &OrientedBox, handle: Handle) -> egui::CursorIcon {
+    let (u, v) = b.axes();
+    let dx = u.0 * handle.hx as f32 + v.0 * handle.vy as f32;
+    let dy = u.1 * handle.hx as f32 + v.1 * handle.vy as f32;
+    // 8 sectors of 45°, centered on the compass directions (0 = W).
+    let sector = ((dy.atan2(dx).to_degrees() + 202.5).rem_euclid(360.0) / 45.0) as i32 % 8;
+    match sector {
+        0 | 4 => egui::CursorIcon::ResizeHorizontal, // W, E
+        1 | 5 => egui::CursorIcon::ResizeNwSe,       // NW, SE
+        2 | 6 => egui::CursorIcon::ResizeVertical,   // N, S
+        _ => egui::CursorIcon::ResizeNeSw,           // NE, SW
     }
 }
 
-/// Dashed rectangle outline between two screen corners.
-fn draw_dashed_rect(painter: &egui::Painter, a: Pos2, b: Pos2, color: Color32) {
+/// Dashed outline through the given screen corners.
+fn draw_dashed_polygon(painter: &egui::Painter, corners: &[Pos2; 4], color: Color32) {
     let stroke = Stroke::new(2.0, color);
-    let r = Rect::from_two_pos(a, b);
-    let corners = [
-        [r.left_top(), r.right_top()],
-        [r.right_top(), r.right_bottom()],
-        [r.right_bottom(), r.left_bottom()],
-        [r.left_bottom(), r.left_top()],
-    ];
-    for edge in corners {
-        painter.add(egui::Shape::dashed_line(&edge, stroke, 6.0, 4.0));
+    for i in 0..4 {
+        painter.add(egui::Shape::dashed_line(
+            &[corners[i], corners[(i + 1) % 4]],
+            stroke,
+            6.0,
+            4.0,
+        ));
     }
 }
 
@@ -2115,5 +2281,16 @@ impl eframe::App for CropApp {
         egui::CentralPanel::default().show(ui, |ui| {
             self.viewer(ui);
         });
+    }
+}
+
+/// How the loaded frames relate to the files: the orientation applied to a
+/// TIFF folder, or a note that a `.npy` stack is taken as it is (its frames
+/// were oriented by whoever wrote it).
+fn orientation_note(data: &loader::FolderData) -> String {
+    if data.path.is_dir() {
+        data.orientation.label().to_owned()
+    } else {
+        "frames already oriented (.npy stack)".to_owned()
     }
 }

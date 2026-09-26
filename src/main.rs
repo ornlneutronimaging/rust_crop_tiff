@@ -6,7 +6,7 @@
 //! edge-band statistics plot.
 
 use rust_crop_tiff::app::CropApp;
-use rust_crop_tiff::crop::CropRect;
+use rust_crop_tiff::crop::OrientedBox;
 use std::path::PathBuf;
 
 const USAGE: &str = "\
@@ -41,7 +41,7 @@ OPTIONS:
                             <stem>_crop.json sidecar next to the stack, so
                             the caller can re-apply the same crop to another
                             data set.
-  -c, --crop <X,Y,W,H>      Initial crop region (e.g. a previous crop) shown
+  -c, --crop <X,Y,W,H[,A]>  Initial crop region (e.g. a previous crop) shown
                             on the image at startup, e.g. 100,200,512,512 —
                             in the on-disk frame of the files, like the
                             saved JSON
@@ -49,8 +49,8 @@ OPTIONS:
                             written by a previous session
   --detector <NAME>         Force the detector the inputs are loaded as,
                             which decides how the frames are shown: timepix
-                            (transposed), ccd (flipped vertically), qhy
-                            (as-is, not decided yet) or as-is. By default the
+                            (transposed), ccd (flipped vertically and horizontally), qhy
+                            (rotated 90° counterclockwise) or as-is. By default the
                             detector is recognized from the folder layout
                             (images/tpx1, images/ikonxl, …); the toolbar has
                             a combobox to change it. The crop is drawn on
@@ -76,7 +76,7 @@ struct Args {
     inputs: Vec<PathBuf>,
     output: Option<PathBuf>,
     output_stack: Option<PathBuf>,
-    initial_crop: Option<CropRect>,
+    initial_crop: Option<OrientedBox>,
     called_from_app: bool,
     instructions: Option<String>,
     detector: Option<rust_crop_tiff::loader::Detector>,
@@ -86,7 +86,7 @@ fn parse_args() -> Result<Args, String> {
     let mut inputs = Vec::new();
     let mut output = None;
     let mut output_stack: Option<PathBuf> = None;
-    let mut initial_crop: Option<CropRect> = None;
+    let mut initial_crop: Option<OrientedBox> = None;
     let mut called_from_app = false;
     let mut instructions = None;
     let mut detector = None;
@@ -117,11 +117,11 @@ fn parse_args() -> Result<Args, String> {
                 output_stack = Some(path);
             }
             "-c" | "--crop" => {
-                let v = args.next().ok_or("--crop requires X,Y,WIDTH,HEIGHT")?;
+                let v = args.next().ok_or("--crop requires X,Y,WIDTH,HEIGHT[,ANGLE]")?;
                 if initial_crop.is_some() {
                     return Err("only one of --crop / --crop-file can be given".to_owned());
                 }
-                initial_crop = Some(CropRect::parse_arg(&v).map_err(|e| format!("--crop: {e}"))?);
+                initial_crop = Some(OrientedBox::parse_arg(&v).map_err(|e| format!("--crop: {e}"))?);
             }
             "--crop-file" | "--crop_file" => {
                 let path = args.next().ok_or("--crop-file requires a path")?;
@@ -131,7 +131,7 @@ fn parse_args() -> Result<Args, String> {
                 let text = std::fs::read_to_string(&path)
                     .map_err(|e| format!("cannot read --crop-file {path}: {e}"))?;
                 initial_crop = Some(
-                    CropRect::from_json_text(&text)
+                    OrientedBox::from_json_text(&text)
                         .map_err(|e| format!("--crop-file {path}: {e}"))?,
                 );
             }

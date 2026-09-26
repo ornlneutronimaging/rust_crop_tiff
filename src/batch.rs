@@ -21,7 +21,7 @@
 //! folder with the crop drawn on it before running.
 
 use crate::colormap::Colormap;
-use crate::crop::CropRect;
+use crate::crop::{CropRect, OrientedBox};
 use crate::loader::{self, Detector, Orientation, Selection};
 use anyhow::{bail, Context, Result};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions};
@@ -55,8 +55,8 @@ const BAD_COLOR: Color32 = Color32::from_rgb(255, 90, 80);
 /// The crop and the stack it was drawn on, as the main window has them.
 #[derive(Clone)]
 pub struct BatchRef {
-    /// The crop as drawn, on the oriented frames.
-    pub crop: CropRect,
+    /// The crop as drawn, on the oriented frames (possibly tilted).
+    pub crop: OrientedBox,
     /// Oriented size of the reference stack.
     pub width: usize,
     pub height: usize,
@@ -78,7 +78,7 @@ impl BatchRef {
     /// The crop in the on-disk frame of the reference stack (what the output
     /// folder names carry, like the single export).
     fn disk_crop(&self) -> CropRect {
-        self.crop.to_disk(self.orientation, self.width, self.height)
+        self.crop.disk_bounds(self.orientation, self.width, self.height)
     }
 }
 
@@ -379,7 +379,7 @@ pub fn export_folder<F>(
     src: &Path,
     dest: &Path,
     detector: Selection,
-    crop: CropRect,
+    crop: &OrientedBox,
     cancel: &AtomicBool,
     on_progress: F,
 ) -> Result<FolderReport>
@@ -414,17 +414,23 @@ where
             for frame in &frames {
                 let (h, w) = (frame.nrows(), frame.ncols());
                 dims = (w, h);
-                if crop.x1() > w || crop.y1() > h {
+                let bb = crop.bounding();
+                if bb.x0 < 0.0 || bb.y0 < 0.0 || bb.x1 > w as f32 || bb.y1 > h as f32 {
                     bail!(
-                        "the crop ({}×{} at {}, {}) does not fit the {w}×{h} images of {}",
+                        "the crop ({}×{} at {}, {}{}) does not fit the {w}×{h} images of {}",
                         crop.width,
                         crop.height,
-                        crop.x,
-                        crop.y,
+                        bb.x0,
+                        bb.y0,
+                        if crop.is_axis_aligned() {
+                            String::new()
+                        } else {
+                            format!(", tilted {:+.1}°", crop.angle_deg)
+                        },
                         src.display()
                     );
                 }
-                let cropped = loader::crop_to_disk(frame, crop, orientation);
+                let cropped = loader::extract_to_disk(frame, crop, orientation);
                 let (dh, dw) = (cropped.nrows(), cropped.ncols());
                 let values: Vec<f32> = cropped.iter().copied().collect();
                 enc.write_image::<tiff::encoder::colortype::Gray32Float>(
@@ -765,7 +771,7 @@ impl BatchWindow {
                     done: 0,
                     total: 0,
                 });
-                let result = export_folder(&src, &dest, detector, r.crop, &cancel, |done, total| {
+                let result = export_folder(&src, &dest, detector, &r.crop, &cancel, |done, total| {
                     if let Ok(tx) = progress_tx.lock() {
                         let _ = tx.send(JobMsg::Progress { idx, done, total });
                     }
@@ -1308,27 +1314,43 @@ fn draw_preview(ui: &mut egui::Ui, p: &Preview, r: &BatchRef, view: f32) -> egui
     let response = ui.add(egui::Image::new((p.tex.id(), size)).sense(Sense::click()));
     let rect = response.rect;
     let painter = ui.painter_at(rect);
-    let crop = r.crop;
-    let fits = crop.x1() <= p.width && crop.y1() <= p.height;
+    let bb = r.crop.bounding();
+    let fits = bb.x0 >= 0.0 && bb.y0 >= 0.0 && bb.x1 <= w && bb.y1 <= h;
     let same = (p.width, p.height) == (r.width, r.height);
-    let to_screen = |x: usize, y: usize| {
+    let to_screen = |x: f32, y: f32| {
         Pos2::new(
-            rect.left() + (x as f32).min(w) * scale,
-            rect.top() + (y as f32).min(h) * scale,
+            rect.left() + x.clamp(0.0, w) * scale,
+            rect.top() + y.clamp(0.0, h) * scale,
         )
     };
-    let c = Rect::from_min_max(to_screen(crop.x, crop.y), to_screen(crop.x1(), crop.y1()));
+    let color = if fits { CROP_COLOR } else { BAD_COLOR };
     let dim = Color32::from_black_alpha(150);
-    painter.rect_filled(Rect::from_min_max(rect.min, Pos2::new(rect.right(), c.top())), 0.0, dim);
-    painter.rect_filled(Rect::from_min_max(Pos2::new(rect.left(), c.bottom()), rect.max), 0.0, dim);
-    painter.rect_filled(Rect::from_min_max(Pos2::new(rect.left(), c.top()), Pos2::new(c.left(), c.bottom())), 0.0, dim);
-    painter.rect_filled(Rect::from_min_max(Pos2::new(c.right(), c.top()), Pos2::new(rect.right(), c.bottom())), 0.0, dim);
-    painter.rect_stroke(
-        c,
-        0.0,
-        Stroke::new(1.5, if fits { CROP_COLOR } else { BAD_COLOR }),
-        egui::StrokeKind::Inside,
-    );
+    if r.crop.is_axis_aligned() {
+        let c = Rect::from_min_max(to_screen(bb.x0, bb.y0), to_screen(bb.x1, bb.y1));
+        painter.rect_filled(Rect::from_min_max(rect.min, Pos2::new(rect.right(), c.top())), 0.0, dim);
+        painter.rect_filled(Rect::from_min_max(Pos2::new(rect.left(), c.bottom()), rect.max), 0.0, dim);
+        painter.rect_filled(Rect::from_min_max(Pos2::new(rect.left(), c.top()), Pos2::new(c.left(), c.bottom())), 0.0, dim);
+        painter.rect_filled(Rect::from_min_max(Pos2::new(c.right(), c.top()), Pos2::new(rect.right(), c.bottom())), 0.0, dim);
+        painter.rect_stroke(c, 0.0, Stroke::new(1.5, color), egui::StrokeKind::Inside);
+    } else {
+        // A tilted region: darken everything, repaint the region undimmed
+        // from the thumbnail texture, then outline it.
+        painter.rect_filled(rect, 0.0, dim);
+        let mut mesh = egui::Mesh::with_texture(p.tex.id());
+        for (ix, iy) in r.crop.corners() {
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: to_screen(ix, iy),
+                uv: Pos2::new((ix / w).clamp(0.0, 1.0), (iy / h).clamp(0.0, 1.0)),
+                color: Color32::WHITE,
+            });
+        }
+        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        painter.add(mesh);
+        let corners = r.crop.corners().map(|(ix, iy)| to_screen(ix, iy));
+        for k in 0..4 {
+            painter.line_segment([corners[k], corners[(k + 1) % 4]], Stroke::new(1.5, color));
+        }
+    }
     let mut tip = format!(
         "{} files ({} averaged), {}×{} px, {}: {}",
         p.n_files,
@@ -1488,19 +1510,19 @@ mod tests {
         }
         std::fs::write(src.join("run_Spectra.txt"), "spectra").unwrap();
         let dest = root.join("out");
-        let crop = CropRect {
+        let crop = OrientedBox::from_crop(CropRect {
             x: 2,
             y: 1,
             width: 5,
             height: 4,
-        };
+        });
         let cancel = AtomicBool::new(false);
         let progress = AtomicUsize::new(0);
         let report = export_folder(
             &src,
             &dest,
             Selection::from_path(&src),
-            crop,
+            &crop,
             &cancel,
             |done, _total| {
                 progress.fetch_max(done, Ordering::Relaxed);
@@ -1511,8 +1533,8 @@ mod tests {
         assert_eq!(progress.load(Ordering::Relaxed), 3);
         assert!(dest.join("run_Spectra.txt").is_file());
         let json = std::fs::read_to_string(dest.join("crop_region.json")).unwrap();
-        assert_eq!(CropRect::from_json_text(&json).unwrap(), crop);
-        let data = loader::load_folder_with_progress(&dest, Selection::from_path(&dest), |_, _| {}).unwrap();
+        assert_eq!(OrientedBox::from_json_text(&json).unwrap(), crop);
+        let data = loader::load_folder_with_progress(&dest, Selection::from_path(&dest), |_| {}).unwrap();
         assert_eq!(data.n_frames(), 3);
         assert_eq!((data.width, data.height), (5, 4));
         // Top-left cropped pixel is the source pixel (x=2, y=1) = 1*10+2.
@@ -1525,7 +1547,7 @@ mod tests {
             width: 5,
             height: 4,
         };
-        assert!(export_folder(&src, &root.join("out2"), Selection::from_path(&src), big, &cancel, |_, _| {}).is_err());
+        assert!(export_folder(&src, &root.join("out2"), Selection::from_path(&src), &OrientedBox::from_crop(big), &cancel, |_, _| {}).is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

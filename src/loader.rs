@@ -12,7 +12,10 @@
 //! projections used to judge a crop against the whole stack: sum, mean, max,
 //! min and standard deviation, plus the total counts of each frame.
 
+use crate::crop::OrientedBox;
+#[cfg(test)]
 use crate::crop::CropRect;
+use crate::extract;
 use anyhow::{anyhow, bail, Context, Result};
 pub use detector_orientation::{Detector, Orientation, Selection, Source};
 use ndarray::{s, Array2, Array3};
@@ -134,49 +137,170 @@ pub fn is_supported_input(path: &Path) -> bool {
                 .is_some_and(|e| e.eq_ignore_ascii_case("npy")))
 }
 
+/// How far a load has come. A folder counts its files; a `.npy` stack is one
+/// file holding the whole stack, so there the frame count (from the header)
+/// says what is being loaded and the bytes read drive the bar.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoadProgress {
+    pub files_done: usize,
+    pub files_total: usize,
+    /// Frames being loaded: the file count of a folder, the header's axis 0
+    /// for a `.npy` stack.
+    pub frames_total: usize,
+    /// Bytes of a `.npy` stack read so far (0 / 0 for a folder).
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    /// The `.npy` file name, empty for a folder.
+    pub stack_file: String,
+}
+
+impl LoadProgress {
+    /// Fraction of the work done: bytes for a stack file, files otherwise.
+    pub fn fraction(&self) -> f32 {
+        if self.bytes_total > 0 {
+            (self.bytes_done as f64 / self.bytes_total as f64).clamp(0.0, 1.0) as f32
+        } else if self.files_total > 0 {
+            self.files_done as f32 / self.files_total as f32
+        } else {
+            0.0
+        }
+    }
+
+    /// The progress bar text: `1385 images from sample_stack.npy — 1.2 GB of
+    /// 3.3 GB`, or `240 / 1385 files`.
+    pub fn text(&self) -> String {
+        if self.stack_file.is_empty() {
+            format!("{} / {} files", self.files_done, self.files_total)
+        } else {
+            format!(
+                "{} image{} from {} — {} of {}",
+                self.frames_total,
+                if self.frames_total == 1 { "" } else { "s" },
+                self.stack_file,
+                format_bytes(self.bytes_done),
+                format_bytes(self.bytes_total),
+            )
+        }
+    }
+}
+
+/// Bytes for the progress text: `512 B`, `8.4 MB`, `3.31 GB`.
+pub fn format_bytes(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1e9 {
+        format!("{:.2} GB", b / 1e9)
+    } else if b >= 1e6 {
+        format!("{:.1} MB", b / 1e6)
+    } else if b >= 1e3 {
+        format!("{:.0} kB", b / 1e3)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// The frame count announced by a `.npy` header (axis 0 of a 3-D array, 1
+/// for a 2-D one) without reading the data.
+pub fn npy_frame_count(path: &Path) -> Option<usize> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 12];
+    file.read_exact(&mut head).ok()?;
+    if &head[..6] != b"\x93NUMPY" {
+        return None;
+    }
+    let (header_len, offset) = match head[6] {
+        1 => (u16::from_le_bytes([head[8], head[9]]) as usize, 10),
+        _ => (u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize, 12),
+    };
+    let mut header = vec![0u8; header_len];
+    let already = 12 - offset;
+    header[..already].copy_from_slice(&head[offset..]);
+    file.read_exact(&mut header[already..]).ok()?;
+    let header = String::from_utf8_lossy(&header);
+    let shape = header.split("'shape':").nth(1)?;
+    let inner = shape.split('(').nth(1)?.split(')').next()?;
+    let dims: Vec<usize> = inner
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().ok())
+        .collect::<Option<Vec<usize>>>()?;
+    match dims.len() {
+        2 => Some(1),
+        3 => Some(dims[0]),
+        _ => None,
+    }
+}
+
 /// Load one input — a folder of TIFF images or a `.npy` stack file — and
 /// compute the projections. `detector` decides how TIFF frames are oriented
-/// (a `.npy` stack is loaded as-is). `on_progress(files_done, files_total)`
-/// is called from worker threads as files finish, so a caller can drive a
-/// progress bar.
+/// (a `.npy` stack is loaded as-is). `on_progress` is called from worker
+/// threads as files finish (or every few megabytes of a `.npy` stack), so a
+/// caller can drive a progress bar.
 pub fn load_input_with_progress<F>(
     path: &Path,
     detector: Selection,
     on_progress: F,
 ) -> Result<FolderData>
 where
-    F: Fn(usize, usize) + Sync,
+    F: Fn(&LoadProgress) + Sync,
 {
     if path.is_dir() {
         return load_folder_with_progress(path, detector, on_progress);
     }
-    let frames = load_npy(path)?;
-    on_progress(1, 1);
+    let mut progress = LoadProgress {
+        files_total: 1,
+        frames_total: npy_frame_count(path).unwrap_or(1),
+        bytes_total: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        stack_file: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        ..LoadProgress::default()
+    };
+    on_progress(&progress);
+    let frames = load_npy(path, &mut |read| {
+        progress.bytes_done = read;
+        on_progress(&progress);
+    })?;
+    progress.files_done = 1;
+    progress.frames_total = frames.len();
+    progress.bytes_done = progress.bytes_total;
+    on_progress(&progress);
     build_folder_data(path, frames, detector, Orientation::Identity)
 }
 
 /// Load every TIFF of `dir` (in parallel) and compute the projections.
-/// `on_progress(files_done, files_total)` is called from worker threads as
-/// files finish, so a caller can drive a progress bar.
+/// `on_progress` is called from worker threads as files finish, so a caller
+/// can drive a progress bar.
 pub fn load_folder_with_progress<F>(
     dir: &Path,
     detector: Selection,
     on_progress: F,
 ) -> Result<FolderData>
 where
-    F: Fn(usize, usize) + Sync,
+    F: Fn(&LoadProgress) + Sync,
 {
     let orientation = detector.orientation();
     let paths = list_tiff_in_dir(dir)?;
     let total = paths.len();
     let done = AtomicUsize::new(0);
+    let report = |files_done: usize| {
+        on_progress(&LoadProgress {
+            files_done,
+            files_total: total,
+            frames_total: total,
+            ..LoadProgress::default()
+        })
+    };
+    report(0);
 
     // `par_iter().map().collect()` preserves the sorted file order.
     let per_file: Vec<Result<Vec<Array2<f32>>>> = paths
         .par_iter()
         .map(|p| {
             let r = load_tiff(p, orientation);
-            on_progress(done.fetch_add(1, Ordering::Relaxed) + 1, total);
+            report(done.fetch_add(1, Ordering::Relaxed) + 1);
             r
         })
         .collect();
@@ -269,11 +393,28 @@ fn build_folder_data(
 
 /// Read a `.npy` file: a 2-D array becomes one frame, a 3-D array one frame
 /// per plane along axis 0. The dtype is probed among the common numeric types.
-fn load_npy(path: &Path) -> Result<Vec<Array2<f32>>> {
+/// `on_read(bytes_so_far)` is called every few megabytes — the stack handed
+/// over by NeCTAR is one multi-gigabyte file on a network filesystem.
+fn load_npy(path: &Path, on_read: &mut dyn FnMut(u64)) -> Result<Vec<Array2<f32>>> {
     use ndarray_npy::ReadNpyExt;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
 
-    let bytes = std::fs::read(path).with_context(|| format!("open {}", path.display()))?;
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    let mut bytes: Vec<u8> = Vec::with_capacity(size);
+    const CHUNK: usize = 8 << 20;
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..n]);
+        on_read(bytes.len() as u64);
+    }
+    drop(buf);
 
     macro_rules! try_2d {
         ($t:ty) => {
@@ -318,27 +459,36 @@ fn load_npy(path: &Path) -> Result<Vec<Array2<f32>>> {
     )
 }
 
-/// One frame cropped to `crop` (drawn on the oriented frame) and put back in
-/// the on-disk frame: the same pixels as slicing the file on disk with the
-/// crop's [`CropRect::to_disk`] counterpart.
-pub(crate) fn crop_to_disk(frame: &Array2<f32>, crop: CropRect, orientation: Orientation) -> Array2<f32> {
-    orientation.undo_view(frame.slice(s![crop.y..crop.y1(), crop.x..crop.x1()]))
+/// One frame's region, straightened when tilted, and put back in the
+/// on-disk frame of the input files: for an untilted box the same pixels as
+/// slicing the file on disk with the box's [`CropRect::to_disk`] counterpart.
+pub(crate) fn extract_to_disk(
+    frame: &Array2<f32>,
+    region: &OrientedBox,
+    orientation: Orientation,
+) -> Array2<f32> {
+    orientation.undo(extract::extract(frame, region))
 }
 
 /// The cropped stack as one contiguous `float32` array of shape
 /// `(n_frames, disk_height, disk_width)` — the crop in the on-disk frame of
 /// the input files, what `--output-stack` returns to the calling
-/// application. `orientation` is how `frames` were oriented on load.
+/// application. A tilted region comes out straightened (resampled on its
+/// own grid). `orientation` is how `frames` were oriented on load.
 pub fn cropped_stack(
     frames: &[Array2<f32>],
-    crop: CropRect,
+    region: &OrientedBox,
     orientation: Orientation,
 ) -> Array3<f32> {
-    let (dw, dh) = orientation.dims(crop.width, crop.height);
+    let (out_w, out_h) = region.out_size();
+    let (dw, dh) = orientation.dims(out_w, out_h);
+    let extracted: Vec<Array2<f32>> = frames
+        .par_iter()
+        .map(|f| extract_to_disk(f, region, orientation))
+        .collect();
     let mut out = Array3::<f32>::zeros((frames.len(), dh, dw));
-    for (i, f) in frames.iter().enumerate() {
-        out.slice_mut(s![i, .., ..])
-            .assign(&crop_to_disk(f, crop, orientation));
+    for (i, e) in extracted.iter().enumerate() {
+        out.slice_mut(s![i, .., ..]).assign(e);
     }
     out
 }
@@ -348,10 +498,10 @@ pub fn cropped_stack(
 pub fn write_cropped_stack(
     path: &Path,
     frames: &[Array2<f32>],
-    crop: CropRect,
+    region: &OrientedBox,
     orientation: Orientation,
 ) -> Result<()> {
-    let stack = cropped_stack(frames, crop, orientation);
+    let stack = cropped_stack(frames, region, orientation);
     ndarray_npy::write_npy(path, &stack)
         .with_context(|| format!("write cropped stack {}", path.display()))
 }
@@ -363,7 +513,11 @@ pub fn write_cropped_stack(
 /// downstream tools and the spectra file still line up; otherwise the frames
 /// are numbered after the input's stem. Any `*_Spectra.txt` file next to the
 /// input is copied along. Returns status notes for the UI.
-pub fn export_cropped_images(dest: &Path, data: &FolderData, crop: CropRect) -> Result<Vec<String>> {
+pub fn export_cropped_images(
+    dest: &Path,
+    data: &FolderData,
+    region: &OrientedBox,
+) -> Result<Vec<String>> {
     if data.path.is_dir() && dest == data.path {
         bail!("Export folder must be different from the input folder");
     }
@@ -398,7 +552,7 @@ pub fn export_cropped_images(dest: &Path, data: &FolderData, crop: CropRect) -> 
         .zip(names.par_iter())
         .try_for_each(|(frame, name)| -> Result<()> {
             let path = dest.join(name);
-            let cropped = crop_to_disk(frame, crop, data.orientation);
+            let cropped = extract_to_disk(frame, region, data.orientation);
             let (dh, dw) = (cropped.nrows(), cropped.ncols());
             let values: Vec<f32> = cropped.iter().copied().collect();
             let file = std::fs::File::create(&path)
@@ -414,7 +568,8 @@ pub fn export_cropped_images(dest: &Path, data: &FolderData, crop: CropRect) -> 
             Ok(())
         })?;
 
-    let (dw, dh) = data.orientation.dims(crop.width, crop.height);
+    let (out_w, out_h) = region.out_size();
+    let (dw, dh) = data.orientation.dims(out_w, out_h);
     let mut notes = vec![format!(
         "{} cropped images ({dw}×{dh} px on disk, {}) → {}",
         data.frames.len(),
@@ -528,7 +683,7 @@ mod tests {
         write_tiff_u16(&dir.join("img_00001.tif"), 4, 3, 7);
         write_tiff_u16(&dir.join("img_00000.tif"), 4, 3, 5);
 
-        let data = load_folder_with_progress(&dir, Selection::default(), |_, _| {}).unwrap();
+        let data = load_folder_with_progress(&dir, Selection::default(), |_| {}).unwrap();
         assert_eq!(data.n_frames(), 2);
         assert_eq!(data.orientation, Orientation::Identity);
         assert_eq!((data.width, data.height), (4, 3));
@@ -545,7 +700,46 @@ mod tests {
     #[test]
     fn folder_without_tiff_fails() {
         let dir = tmp_dir("empty");
-        assert!(load_folder_with_progress(&dir, Selection::default(), |_, _| {}).is_err());
+        assert!(load_folder_with_progress(&dir, Selection::default(), |_| {}).is_err());
+    }
+
+    #[test]
+    fn npy_stack_progress_counts_images_and_bytes() {
+        let dir = tmp_dir("npy_progress");
+        let path = dir.join("sample_stack.npy");
+        let a = Array3::<f32>::zeros((9, 4, 5));
+        ndarray_npy::write_npy(&path, &a).unwrap();
+        assert_eq!(npy_frame_count(&path), Some(9));
+        let flat = dir.join("one.npy");
+        ndarray_npy::write_npy(&flat, &Array2::<u16>::zeros((4, 5))).unwrap();
+        assert_eq!(npy_frame_count(&flat), Some(1));
+
+        let seen = std::sync::Mutex::new(Vec::<LoadProgress>::new());
+        let data = load_input_with_progress(&path, Selection::default(), |p| {
+            seen.lock().unwrap().push(p.clone())
+        })
+        .unwrap();
+        assert_eq!(data.n_frames(), 9);
+        let seen = seen.into_inner().unwrap();
+        let first = seen.first().unwrap();
+        assert_eq!((first.frames_total, first.files_total, first.files_done), (9, 1, 0));
+        assert_eq!(first.bytes_total, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(first.stack_file, "sample_stack.npy");
+        let last = seen.last().unwrap();
+        assert_eq!(last.files_done, 1);
+        assert_eq!(last.bytes_done, last.bytes_total);
+        assert_eq!(last.fraction(), 1.0);
+        assert!(last.text().starts_with("9 images from sample_stack.npy — "), "{}", last.text());
+        assert_eq!(format_bytes(3_310_000_000), "3.31 GB");
+        // A folder still counts files.
+        let folder = LoadProgress {
+            files_done: 240,
+            files_total: 1385,
+            frames_total: 1385,
+            ..LoadProgress::default()
+        };
+        assert_eq!(folder.text(), "240 / 1385 files");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -561,7 +755,7 @@ mod tests {
         assert!(is_supported_input(&path));
         // a .npy stack is never re-oriented, whatever the detector says
         let timepix = Selection { manual: Some(Detector::Timepix), ..Default::default() };
-        let data = load_input_with_progress(&path, timepix, |_, _| {}).unwrap();
+        let data = load_input_with_progress(&path, timepix, |_| {}).unwrap();
         assert_eq!(data.n_frames(), 2);
         assert_eq!(data.orientation, Orientation::Identity);
         assert_eq!((data.width, data.height), (4, 3));
@@ -576,7 +770,7 @@ mod tests {
         write_tiff_u16(&dir.join("img_00001.tif"), 6, 5, 7);
         std::fs::write(dir.join("run_Spectra.txt"), "tof,counts\n").unwrap();
 
-        let data = load_folder_with_progress(&dir, Selection::default(), |_, _| {}).unwrap();
+        let data = load_folder_with_progress(&dir, Selection::default(), |_| {}).unwrap();
         let crop = CropRect {
             x: 1,
             y: 2,
@@ -584,7 +778,7 @@ mod tests {
             height: 2,
         };
         let dest = tmp_dir("export_dst");
-        let notes = export_cropped_images(&dest, &data, crop).unwrap();
+        let notes = export_cropped_images(&dest, &data, &OrientedBox::from_crop(crop)).unwrap();
         assert!(notes.iter().any(|n| n.contains("2 cropped images")));
         assert!(notes.iter().any(|n| n.contains("spectra file")));
 
@@ -595,7 +789,7 @@ mod tests {
         assert_eq!(frames[0][(0, 0)], 7.0);
 
         // Exporting onto the input folder must be refused.
-        assert!(export_cropped_images(&dir, &data, crop).is_err());
+        assert!(export_cropped_images(&dir, &data, &OrientedBox::from_crop(crop)).is_err());
     }
 
     #[test]
@@ -613,7 +807,7 @@ mod tests {
             width: 3,
             height: 2,
         };
-        write_cropped_stack(&path, &frames, crop, Orientation::Identity).unwrap();
+        write_cropped_stack(&path, &frames, &OrientedBox::from_crop(crop), Orientation::Identity).unwrap();
 
         let file = std::fs::File::open(&path).unwrap();
         let back = Array3::<f32>::read_npy(file).unwrap();
@@ -639,12 +833,12 @@ mod tests {
     fn oriented_crops_write_disk_pixels() {
         let src = tmp_dir("oriented_src");
         write_tiff_pattern(&src.join("img_00000.tif"));
-        let disk = load_folder_with_progress(&src, Selection::default(), |_, _| {}).unwrap();
+        let disk = load_folder_with_progress(&src, Selection::default(), |_| {}).unwrap();
         assert_eq!((disk.width, disk.height), (6, 5));
 
         for det in [Detector::Timepix, Detector::Ccd, Detector::Qhy] {
             let sel = Selection { manual: Some(det), ..Default::default() };
-            let data = load_folder_with_progress(&src, sel, |_, _| {}).unwrap();
+            let data = load_folder_with_progress(&src, sel, |_| {}).unwrap();
             let o = data.orientation;
             assert_eq!(o, det.orientation());
             assert_eq!(data.disk_dims(), (6, 5));
@@ -658,12 +852,12 @@ mod tests {
                 .flat_map(|y| (disk_crop.x..disk_crop.x1()).map(move |x| (10 * y + x) as f32))
                 .collect();
 
-            let stack = cropped_stack(&data.frames, crop, o);
+            let stack = cropped_stack(&data.frames, &OrientedBox::from_crop(crop), o);
             assert_eq!(stack.shape(), &[1, disk_crop.height, disk_crop.width], "{det:?}");
             assert_eq!(stack.iter().copied().collect::<Vec<_>>(), expected, "{det:?} stack");
 
             let dest = tmp_dir(&format!("oriented_dst_{det:?}"));
-            export_cropped_images(&dest, &data, crop).unwrap();
+            export_cropped_images(&dest, &data, &OrientedBox::from_crop(crop)).unwrap();
             let frames = load_tiff(&dest.join("img_00000.tif"), Orientation::Identity).unwrap();
             assert_eq!(frames[0].shape(), &[disk_crop.height, disk_crop.width], "{det:?}");
             assert_eq!(frames[0].iter().copied().collect::<Vec<_>>(), expected, "{det:?} tiff");
