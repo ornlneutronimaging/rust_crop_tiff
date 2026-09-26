@@ -2271,10 +2271,15 @@ impl eframe::App for CropApp {
             self.status_bar(ui);
         });
         // The crop panel opens at 38% of the window width; it stays resizable
-        // from the divider.
+        // from the divider, but never past half the window, so the image on
+        // the left always keeps at least 50% of the view. (A stored panel
+        // width from a wider window, or a divider dragged all the way left,
+        // used to leave the viewer squeezed to nothing after a load.)
+        let content_w = ctx.content_rect().width();
         egui::Panel::right("crop_panel")
             .resizable(true)
-            .default_size(ctx.content_rect().width() * 0.38)
+            .default_size(content_w * 0.38)
+            .max_size(content_w * 0.5)
             .show(ui, |ui| {
                 self.crop_panel(ui);
             });
