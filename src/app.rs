@@ -8,6 +8,7 @@ use crate::batch::{self, BatchRef, BatchWindow};
 use crate::colormap::Colormap;
 use crate::crop::{OrientedBox, RectF};
 use crate::loader::{self, Detector, FolderData, Selection};
+use crate::logger;
 use crate::stats::{self, CropStats};
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions};
@@ -245,6 +246,18 @@ impl CropApp {
         } else {
             format!("{} input(s) on the command line.", inputs.len())
         };
+        logger::log(format!(
+            "Inputs: {}; output: {}; output stack: {}; initial crop: {}; called from app: {}",
+            if inputs.is_empty() {
+                "(none)".to_owned()
+            } else {
+                inputs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            },
+            output_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".to_owned()),
+            output_stack.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".to_owned()),
+            initial_crop.map(|c| crop_summary(&c)).unwrap_or_else(|| "(none)".to_owned()),
+            called_from_app,
+        ));
         Self {
             inputs,
             selected_input: None,
@@ -302,7 +315,22 @@ impl CropApp {
     /// Force the detector (hence the orientation) of every input, `None` to
     /// go back to the automatic guess (the `--detector` command-line option).
     pub fn set_detector_override(&mut self, detector: Option<Detector>) {
+        if let Some(d) = detector {
+            logger::log(format!("Detector forced from the command line: {}", d.label()));
+        }
         self.detector_override = detector;
+    }
+
+    /// Status-bar message, also written to the application log.
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status = msg.into();
+        logger::log(&self.status);
+    }
+
+    /// Status-bar error message, written to the application log as ERROR.
+    fn set_error(&mut self, msg: impl Into<String>) {
+        self.status = msg.into();
+        logger::error(&self.status);
     }
 
     /// Detector to load `path` with: the user's override, else the folder
@@ -367,8 +395,14 @@ impl CropApp {
                         .to_owned()
                 });
         }
-        if changed && let Some(idx) = self.selected_input {
-            self.select_input(idx, ctx);
+        if changed {
+            logger::log(format!(
+                "Detector set to {}",
+                self.detector_override.map(|d| d.label().to_owned()).unwrap_or_else(|| "auto".to_owned())
+            ));
+            if let Some(idx) = self.selected_input {
+                self.select_input(idx, ctx);
+            }
         }
     }
 
@@ -396,6 +430,7 @@ impl CropApp {
         self.selected_input = Some(idx);
         self.status = format!("Loading {}…", folder_label(&dir));
         let detector = self.detector_for(&dir);
+        logger::log(format!("Loading input {}: {}", idx + 1, dir.display()));
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
 
@@ -446,7 +481,7 @@ impl CropApp {
             self.loading = None;
             match res {
                 Ok(data) => self.apply_data(data),
-                Err(e) => self.status = format!("Load failed: {e:#}"),
+                Err(e) => self.set_error(format!("Load failed: {e:#}")),
             }
         }
     }
@@ -530,6 +565,13 @@ impl CropApp {
             orientation_note(&data),
             folder_label(&data.path),
         );
+        logger::log(format!(
+            "Loaded {} images ({w}×{h} px, {}: {}) from {}{crop_note}",
+            data.n_frames(),
+            data.detector.summary(),
+            orientation_note(&data),
+            data.path.display(),
+        ));
 
         self.data = Some(Arc::new(data));
         self.img_dirty = true;
@@ -632,6 +674,7 @@ impl CropApp {
 
     fn set_mode(&mut self, mode: DisplayMode) {
         if self.mode != mode {
+            logger::log(format!("Display mode: {}", mode.label()));
             self.mode = mode;
             if mode != DisplayMode::Single {
                 self.playing = false;
@@ -716,17 +759,36 @@ impl CropApp {
             return;
         }
         let (Some(data), Some(crop)) = (self.data.clone(), self.crop_box()) else {
-            self.status = "Nothing to save — draw a crop region first.".to_owned();
+            self.set_status("Nothing to save — draw a crop region first.");
             return;
         };
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.saving_rx = Some(rx);
         self.close_after_save = close_after;
+        let disk = crop.disk_bounds(data.orientation, data.width, data.height);
+        logger::log(format!(
+            "Save started: crop {} (on disk x {} y {} {}×{} px) of {} ({} images, {}×{} px, {}); \
+             json → {}{}; stack → {}; close after: {close_after}",
+            crop_summary(&crop),
+            disk.x,
+            disk.y,
+            disk.width,
+            disk.height,
+            data.path.display(),
+            data.n_frames(),
+            data.width,
+            data.height,
+            data.orientation.label(),
+            json_dest.file.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".to_owned()),
+            if json_dest.stdout { " + stdout" } else { "" },
+            stack_dest.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".to_owned()),
+        ));
         self.status = match &stack_dest {
             Some(p) => format!("Writing the cropped stack to {}…", p.display()),
             None => "Saving the crop…".to_owned(),
         };
+        logger::log(&self.status);
 
         std::thread::spawn(move || {
             let result = (|| -> Result<String, String> {
@@ -765,12 +827,13 @@ impl CropApp {
                 self.saving_rx = None;
                 match result {
                     Ok(msg) => {
-                        self.status = msg;
+                        self.set_status(msg);
                         if self.close_after_save {
+                            logger::log("Save done; closing the window");
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     }
-                    Err(e) => self.status = e,
+                    Err(e) => self.set_error(e),
                 }
                 self.close_after_save = false;
             }
@@ -835,8 +898,10 @@ impl CropApp {
             .set_title("Save the crop region as JSON")
             .save_file()
         else {
+            logger::log("Save as JSON: dialog cancelled");
             return;
         };
+        logger::log(format!("Save as JSON: {}", path.display()));
         self.start_save(
             JsonDest {
                 file: Some(path),
@@ -855,8 +920,10 @@ impl CropApp {
             .set_title("Save the cropped 3-D stack as .npy (float32)")
             .save_file()
         else {
+            logger::log("Save as NumPy array: dialog cancelled");
             return;
         };
+        logger::log(format!("Save as NumPy array: {}", path.display()));
         // The applied crop region always travels with the stack, as a
         // `<stem>_crop.json` sidecar.
         self.start_save(
@@ -875,8 +942,10 @@ impl CropApp {
             .set_title("Export the cropped images — pick where the new folder is created")
             .pick_folder()
         else {
+            logger::log("Export cropped stack: dialog cancelled");
             return;
         };
+        logger::log(format!("Export cropped stack: folder picked {}", dest.display()));
         self.start_export(dest);
     }
 
@@ -890,7 +959,7 @@ impl CropApp {
             return;
         }
         let (Some(data), Some(crop)) = (self.data.clone(), self.crop_box()) else {
-            self.status = "Nothing to export — draw a crop region first.".to_owned();
+            self.set_status("Nothing to export — draw a crop region first.");
             return;
         };
         let stem = if data.path.is_dir() {
@@ -907,7 +976,17 @@ impl CropApp {
         let (tx, rx) = std::sync::mpsc::channel();
         self.saving_rx = Some(rx);
         self.close_after_save = false;
-        self.status = format!("Exporting the cropped images to {}…", dest.display());
+        self.set_status(format!("Exporting the cropped images to {}…", dest.display()));
+        logger::log(format!(
+            "Export started: crop {} (on disk x {} y {} {}×{} px) of {} ({} images)",
+            crop_summary(&crop),
+            disk.x,
+            disk.y,
+            disk.width,
+            disk.height,
+            data.path.display(),
+            data.n_frames(),
+        ));
 
         std::thread::spawn(move || {
             let result = (|| -> Result<String, String> {
@@ -1029,13 +1108,96 @@ impl CropApp {
 
     // ----- UI -------------------------------------------------------------------
 
+    // ----- drag & drop ---------------------------------------------------------
+
+    /// Files or folders dropped onto the window are added as inputs, exactly
+    /// as the *Add folder…* / *Add .npy…* buttons would: a folder is a folder
+    /// of TIFF images, a `.npy` file is a stack, and TIFF files stand for the
+    /// folder that holds them (so dragging a few images from a run folder
+    /// loads that run). The first new input is selected. While something is
+    /// dragged over the window, a dark overlay says what can be dropped.
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let rect = ctx.content_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_overlay"),
+            ));
+            painter.rect_filled(rect, 0.0, Color32::from_black_alpha(170));
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop folders of TIFF images, TIFF files or .npy stacks",
+                egui::FontId::proportional(22.0),
+                Color32::WHITE,
+            );
+        }
+        let dropped: Vec<PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if dropped.is_empty() {
+            return;
+        }
+        logger::log(format!(
+            "Dropped on the window: {}",
+            dropped.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        ));
+        let mut new_inputs: Vec<PathBuf> = Vec::new();
+        let mut rejected: Vec<String> = Vec::new();
+        for path in dropped {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            if path.is_dir() || (path.is_file() && ext == "npy") {
+                new_inputs.push(path);
+            } else if path.is_file() && (ext == "tif" || ext == "tiff") {
+                if let Some(parent) = path.parent() {
+                    new_inputs.push(parent.to_path_buf());
+                }
+            } else {
+                rejected.push(
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string()),
+                );
+            }
+        }
+        // Keep the drop order, but each input only once (several TIFFs from
+        // one folder collapse to that folder, and an input already in the
+        // list is just re-selected).
+        let mut first_new: Option<usize> = None;
+        for input in new_inputs {
+            let idx = match self.inputs.iter().position(|p| *p == input) {
+                Some(idx) => idx,
+                None => {
+                    self.inputs.push(input);
+                    self.inputs.len() - 1
+                }
+            };
+            first_new.get_or_insert(idx);
+        }
+        if let Some(idx) = first_new {
+            self.select_input(idx, ctx);
+        }
+        if !rejected.is_empty() {
+            self.set_status(format!(
+                "Ignored (not a folder, TIFF or .npy): {}",
+                rejected.join(", ")
+            ));
+        }
+    }
+
     fn add_folder_dialog(&mut self, ctx: &egui::Context) {
         if let Some(dir) = rfd::FileDialog::new()
             .set_title("Add a folder of TIFF images")
             .pick_folder()
         {
+            logger::log(format!("Add folder: {}", dir.display()));
             self.inputs.push(dir);
             self.select_input(self.inputs.len() - 1, ctx);
+        } else {
+            logger::log("Add folder: dialog cancelled");
         }
     }
 
@@ -1045,8 +1207,11 @@ impl CropApp {
             .set_title("Add a .npy stack (2-D or 3-D array)")
             .pick_file()
         {
+            logger::log(format!("Add .npy: {}", file.display()));
             self.inputs.push(file);
             self.select_input(self.inputs.len() - 1, ctx);
+        } else {
+            logger::log("Add .npy: dialog cancelled");
         }
     }
 
@@ -1089,6 +1254,7 @@ impl CropApp {
                 });
             if let Some(i) = clicked {
                 if self.selected_input != Some(i) {
+                    logger::log(format!("Input combobox: picked {}", folder_label(&self.inputs[i])));
                     self.select_input(i, &ctx);
                 }
             }
@@ -1160,6 +1326,7 @@ impl CropApp {
             if self.instructions.is_some() {
                 ui.separator();
                 if ui.button("ℹ Instructions").clicked() {
+                    logger::log("Instructions reopened");
                     self.show_instructions = true;
                 }
             }
@@ -1176,6 +1343,10 @@ impl CropApp {
                 .clicked()
             {
                 self.undo();
+                logger::log(format!(
+                    "Undo: crop now {}",
+                    self.crop.map(|c| crop_summary(&c)).unwrap_or_else(|| "(none)".to_owned())
+                ));
             }
             let has_data = self.data.is_some();
             if ui
@@ -1185,6 +1356,7 @@ impl CropApp {
             {
                 if let Some(data) = &self.data {
                     let full = OrientedBox::full(data.width, data.height);
+                    logger::log(format!("Full image: crop set to {}", crop_summary(&full)));
                     self.set_crop(Some(full));
                 }
             }
@@ -1196,10 +1368,14 @@ impl CropApp {
                 {
                     if let Some(data) = &self.data {
                         match init.snapped(data.width, data.height) {
-                            Some(c) => self.set_crop(Some(c)),
+                            Some(c) => {
+                                logger::log(format!("Use initial crop: {}", crop_summary(&c)));
+                                self.set_crop(Some(c));
+                            }
                             None => {
-                                self.status =
-                                    "Initial crop is outside this image — not applied.".to_owned()
+                                self.set_status(
+                                    "Initial crop is outside this image — not applied.",
+                                );
                             }
                         }
                     }
@@ -1214,11 +1390,16 @@ impl CropApp {
             {
                 self.set_crop(Some(OrientedBox { angle_deg: 0.0, ..b }));
                 self.snap_crop();
+                logger::log(format!(
+                    "Straighten: crop now {}",
+                    self.crop.map(|c| crop_summary(&c)).unwrap_or_else(|| "(none)".to_owned())
+                ));
             }
             if ui
                 .add_enabled(self.crop.is_some(), egui::Button::new("🗑 Clear"))
                 .clicked()
             {
+                logger::log("Clear: crop removed");
                 self.set_crop(None);
             }
 
@@ -1285,6 +1466,7 @@ impl CropApp {
                         .on_hover_text(hover)
                         .clicked()
                     {
+                        logger::log(format!("▶ {label} clicked"));
                         self.save_and_quit();
                     }
                 }
@@ -1293,6 +1475,7 @@ impl CropApp {
                     .on_hover_text("Write the crop region (x, y, width, height — plus center and angle when tilted) to a JSON file")
                     .clicked()
                 {
+                    logger::log("▶ Save as JSON… clicked");
                     self.save_crop_dialog();
                 }
                 if ui
@@ -1303,6 +1486,7 @@ impl CropApp {
                     )
                     .clicked()
                 {
+                    logger::log("▶ Save as NumPy array… clicked");
                     self.save_stack_dialog();
                 }
                 if ui
@@ -1317,6 +1501,7 @@ impl CropApp {
                     )
                     .clicked()
                 {
+                    logger::log("▶ Batch crop… clicked (batch window opened)");
                     let reference = self.batch_ref();
                     self.batch.show(reference);
                 }
@@ -1329,6 +1514,7 @@ impl CropApp {
                     )
                     .clicked()
                 {
+                    logger::log("▶ Export cropped stack… clicked");
                     self.export_folder_dialog();
                 }
                 if self.saving_rx.is_some() {
@@ -1513,6 +1699,7 @@ impl CropApp {
                     )
                     .clicked()
                 {
+                    logger::log(format!("Most suspicious image: showing image {idx}"));
                     self.show_frame(idx);
                 }
             }
@@ -2065,6 +2252,14 @@ fn folder_label(p: &Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
+/// One-line description of a crop for the application log.
+fn crop_summary(b: &OrientedBox) -> String {
+    format!(
+        "center ({:.1}, {:.1}) {:.0}×{:.0} px angle {:.2}°",
+        b.cx, b.cy, b.width, b.height, b.angle_deg
+    )
+}
+
 /// Min/max of the finite values; `(inf, -inf)` when there are none.
 pub(crate) fn raw_range<I: Iterator<Item = f32>>(vals: I) -> (f32, f32) {
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -2263,6 +2458,7 @@ impl eframe::App for CropApp {
         self.ensure_img_texture(&ctx);
         self.instructions_modal(&ctx);
         self.batch_window(&ctx);
+        self.handle_drops(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             self.toolbar(ui);

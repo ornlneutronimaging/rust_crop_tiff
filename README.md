@@ -41,8 +41,9 @@ crop_tiff stack.npy --called-from-app \
   stack files: a 2-D array is one image, a 3-D array one image per plane along
   axis 0 (the form used when another application hands its loaded stack over).
   More inputs can be added from within the application (**📁 Add folder…**,
-  **🗋 Add .npy…**); a crop drawn on one input is kept when switching to
-  another input with the same image size.
+  **🗋 Add .npy…**, or **drag & drop** folders, `.npy` stacks or TIFF files —
+  dropped TIFF files stand for the folder that holds them); a crop drawn on
+  one input is kept when switching to another input with the same image size.
 - **`-o, --output <PATH>`** — enables the **✅ Save crop & quit** button, which
   writes the crop JSON to `PATH` and closes the app.
 - **`--output-stack <PATH.npy>`** — also write the **cropped 3-D stack** when
@@ -201,6 +202,15 @@ dev**, **Single image**. Contrast limits (with **Auto** reset per mode),
 colormaps (Gray, Viridis, Inferno, Magma, Plasma, Cividis, Turbo, Jet), zoom
 −/+/Fit. The status bar shows the cursor position/value; the crop panel shows
 the fraction of pixels kept and the resulting stack size in memory.
+
+## Log
+
+Every session appends to `/SNS/VENUS/shared/log/crop_tiff_<user>.log`
+(inputs loaded, crop actions, saves/exports with their destination and crop
+bounds, batch jobs, errors and crashes), in the same line format as the other
+VENUS tools, so it can be read back in the Log Browser
+(`rust_log_browser`). Logging is best-effort: if the file cannot be opened a
+warning is printed and the application runs without a log.
 
 ## Tests
 

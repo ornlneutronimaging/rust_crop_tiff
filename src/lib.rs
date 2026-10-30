@@ -11,6 +11,7 @@ pub mod colormap;
 pub mod crop;
 pub mod extract;
 pub mod loader;
+pub mod logger;
 pub mod stats;
 pub mod theme;
 pub mod zoom;

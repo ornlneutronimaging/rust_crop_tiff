@@ -23,6 +23,7 @@
 use crate::colormap::Colormap;
 use crate::crop::{CropRect, OrientedBox};
 use crate::loader::{self, Detector, Orientation, Selection};
+use crate::logger;
 use anyhow::{bail, Context, Result};
 use egui::{Color32, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions};
 use ndarray::Array2;
@@ -605,6 +606,24 @@ impl BatchWindow {
                         }
                     }
                     Ok(JobMsg::Done { idx, result }) => {
+                        let name = self
+                            .folders
+                            .get(idx)
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| format!("folder {idx}"));
+                        match &result {
+                            Ok(r) => logger::log(format!(
+                                "Batch: {name} → {} ({} file(s){})",
+                                r.dest.display(),
+                                r.n_files,
+                                if r.notes.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("; {}", r.notes.join(", "))
+                                }
+                            )),
+                            Err(e) => logger::error(format!("Batch: {name} failed: {e}")),
+                        }
                         if let Some(row) = self.rows.get_mut(idx) {
                             *row = match result {
                                 Ok(r) => RowState::Done(r),
@@ -642,6 +661,11 @@ impl BatchWindow {
                     if cancelled { "Batch cancelled" } else { "Batch done" },
                     parts.join(", ")
                 );
+                if n_fail > 0 {
+                    logger::error(&self.status);
+                } else {
+                    logger::log(&self.status);
+                }
             } else {
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
@@ -669,6 +693,11 @@ impl BatchWindow {
                             }
                             Err(e) => Err(e),
                         };
+                        if let Err(e) = &entry
+                            && let Some(f) = self.folders.get(idx)
+                        {
+                            logger::warn(format!("Batch preview of {} failed: {e}", f.display()));
+                        }
                         if let Some(slot) = self.previews.get_mut(idx) {
                             *slot = Some(entry);
                         }
@@ -754,6 +783,26 @@ impl BatchWindow {
         });
         self.job_ref = Some(r.clone());
         self.status = format!("Cropping {} folder(s)…", plan.len());
+        let n_skipped = self.rows.iter().filter(|s| matches!(s, RowState::Skipped(_))).count();
+        logger::log(format!(
+            "Batch crop started: {} folder(s) ({n_skipped} skipped, no data found), crop on disk \
+             x {} y {} {}×{} px (reference {}×{} px, {}, from {}), data sub-folder '{}', \
+             output {}",
+            plan.len(),
+            disk.x,
+            disk.y,
+            disk.width,
+            disk.height,
+            r.width,
+            r.height,
+            r.orientation.label(),
+            r.source.display(),
+            rel_text(&self.rel),
+            output.display(),
+        ));
+        for (_, src, dest) in &plan {
+            logger::log(format!("Batch plan: {} → {}", src.display(), dest.display()));
+        }
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             for (idx, src, dest) in plan {
@@ -789,6 +838,11 @@ impl BatchWindow {
     // ----- folder list --------------------------------------------------
 
     fn add_folders(&mut self, dirs: Vec<PathBuf>) {
+        logger::log(format!(
+            "Batch: {} folder(s) added: {}",
+            dirs.len(),
+            dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        ));
         let first_before = self.folders.first().cloned();
         for d in dirs {
             if !self.folders.contains(&d) {
@@ -815,9 +869,15 @@ impl BatchWindow {
             });
             self.rel = from_reference.unwrap_or_else(|| auto_find(&self.folders[0]));
             self.rel_text = rel_text(&self.rel);
+            logger::log(format!("Batch: data sub-folder guessed as '{}'", self.rel_text));
         }
         self.tree_cache.clear();
         self.resolve_all();
+        logger::log(format!(
+            "Batch: {} folder(s) listed, {} with data found",
+            self.folders.len(),
+            self.n_ready()
+        ));
     }
 
     /// A folder dialog starting where the loaded data set is (like the main
@@ -845,6 +905,12 @@ impl BatchWindow {
         self.rel_text = rel_text(&rel);
         self.rel = rel;
         self.resolve_all();
+        logger::log(format!(
+            "Batch: data sub-folder set to '{}' ({} of {} folder(s) with data found)",
+            self.rel_text,
+            self.n_ready(),
+            self.folders.len()
+        ));
     }
 
     fn resolve_all(&mut self) {
@@ -937,6 +1003,7 @@ impl BatchWindow {
                 .add_enabled(!running && !self.folders.is_empty(), egui::Button::new("🗑 Clear"))
                 .clicked()
             {
+                logger::log("Batch: folder list cleared");
                 self.folders.clear();
                 self.tree_cache.clear();
                 self.resolve_all();
@@ -1023,8 +1090,12 @@ impl BatchWindow {
                 if let Some(dir) = self.output.as_ref().or(self.folders.first()) {
                     dialog = dialog.set_directory(dir.parent().unwrap_or(dir));
                 }
-                if let Some(dir) = dialog.pick_folder() {
-                    self.output = Some(dir);
+                match dialog.pick_folder() {
+                    Some(dir) => {
+                        logger::log(format!("Batch: output folder {}", dir.display()));
+                        self.output = Some(dir);
+                    }
+                    None => logger::log("Batch: output folder dialog cancelled"),
                 }
             }
             match &self.output {
@@ -1077,12 +1148,14 @@ impl BatchWindow {
                 .on_hover_text("Crop every folder with data found and write it under the output folder")
                 .clicked()
             {
+                logger::log("▶ Crop all folders clicked");
                 self.start_job(ctx);
             }
             if running {
                 if ui.button("⏹ Cancel").clicked()
                     && let Some(job) = &self.job
                 {
+                    logger::log("Batch: cancel requested");
                     job.cancel.store(true, Ordering::Relaxed);
                 }
                 let n_done = self

@@ -7,6 +7,7 @@
 
 use rust_crop_tiff::app::CropApp;
 use rust_crop_tiff::crop::OrientedBox;
+use rust_crop_tiff::logger;
 use std::path::PathBuf;
 
 const USAGE: &str = "\
@@ -94,6 +95,7 @@ fn parse_args() -> Result<Args, String> {
     while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => {
+                logger::log("--help requested, exiting");
                 println!("{USAGE}");
                 std::process::exit(0);
             }
@@ -178,9 +180,32 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> eframe::Result<()> {
+    // Shared VENUS log (crop_tiff_<user>.log), so what a user did and where
+    // it failed can be read back in the log browser.
+    if let Err(e) = logger::init() {
+        eprintln!("Warning: logging disabled — {e}");
+    }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    logger::log(format!(
+        "Command line: crop_tiff {}",
+        if argv.is_empty() { "(no arguments)".to_owned() } else { argv.join(" ") }
+    ));
+    if let Ok(cwd) = std::env::current_dir() {
+        logger::log(format!("Working directory: {}", cwd.display()));
+    }
+    // A crash (panic) is the error users report most often without being
+    // able to say what happened: record it before the default hook prints
+    // it to the terminal nobody is looking at.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        logger::error(format!("PANIC: {info}"));
+        default_hook(info);
+    }));
+
     let args = match parse_args() {
         Ok(parsed) => parsed,
         Err(e) => {
+            logger::error(format!("Invalid command line: {e}"));
             eprintln!("Error: {e}\n\n{USAGE}");
             std::process::exit(2);
         }
@@ -193,7 +218,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "VENUS Crop TIFF",
         native_options,
         Box::new(move |cc| {
@@ -214,7 +239,12 @@ fn main() -> eframe::Result<()> {
             app.select_first(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
-    )
+    );
+    match &result {
+        Ok(()) => logger::log("Application closed"),
+        Err(e) => logger::error(format!("Application failed: {e}")),
+    }
+    result
 }
 
 /// egui's proportional family (Ubuntu-Light + the emoji fonts) has no glyph

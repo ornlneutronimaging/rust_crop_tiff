@@ -11,6 +11,7 @@ path = "src/main.rs"
 # Detector → orientation on load (Timepix: transpose, CCD: flip vertically).
 detector_orientation = { path = "../rust_detector_orientation" }
 anyhow = "1.0"
+chrono = "0.4"
 colorgrad = { version = "0.8", features = ["preset"] }
 eframe = "0.35"
 egui = "0.35"
